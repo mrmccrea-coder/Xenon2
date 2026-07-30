@@ -1,0 +1,34 @@
+# Xenon2 Phase 2 -- voice pipeline dependencies.
+#
+# Install into a fresh venv with:
+#   python -m venv .venv
+#   .venv\Scripts\activate
+#   pip install -r requirements.txt
+#
+# torch resolves to the CPU-only wheel (torch==2.13.0+cpu) on a plain `pip install` on
+# this machine -- that's intentional, not a mistake: silero-vad (the only thing in this
+# file that uses torch) is supposed to run on CPU per the spec's GPU/CPU split, so there
+# is no need for (and no attempt made to install) a CUDA build of torch here.
+faster-whisper==1.2.1
+silero-vad==6.2.1
+piper-tts==1.6.0
+sounddevice==0.5.5
+soundfile==0.14.0
+scipy==1.17.1
+numpy==2.4.6
+torch==2.13.0
+
+# --- GPU support for faster-whisper (CTranslate2 backend) ---------------------------------
+# ctranslate2 (faster-whisper's backend) is pulled in automatically as a faster-whisper
+# dependency, but its Windows wheel dynamically links against CUDA *12*'s cublas64_12.dll
+# specifically, regardless of what CUDA Toolkit version is actually installed on the machine.
+# If your CUDA Toolkit is 12.x and its bin/ is on PATH, you may already have this and can
+# skip the two lines below. On this dev machine the installed Toolkit is CUDA 13.3 (needed
+# for Phase 1's rwkv.cpp CUDA build), which does NOT ship cublas64_12.dll -- so
+# faster-whisper's device="cuda" would fail at first inference with "Library
+# cublas64_12.dll is not found or cannot be loaded" without these redistributable packages,
+# which vendor the actual CUDA 12 DLLs faster-whisper needs, independent of the system
+# Toolkit version. See voice-pipeline/stt.py's _ensure_cuda12_dlls() and the README's
+# "GPU/CPU device placement" section for the full story.
+nvidia-cublas-cu12==12.9.2.10
+nvidia-cudnn-cu12==9.24.0.43

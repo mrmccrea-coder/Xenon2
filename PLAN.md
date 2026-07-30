@@ -61,7 +61,7 @@ Tasks:
 
 ---
 
-## Phase 2 — Voice I/O Pipeline
+## Phase 2 — Voice I/O Pipeline [x]
 
 **Depends on**: Phase 1 (needs `generate()` to pipe text through)
 

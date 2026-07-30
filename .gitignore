@@ -13,3 +13,10 @@ models/*.bin
 # Python
 __pycache__/
 *.pyc
+
+# Phase 2 voice pipeline: venv and downloaded model files (piper voice .onnx, faster-whisper's
+# own HuggingFace-cached Whisper weights under the venv/user cache) -- not intended to be
+# committed, same rationale as models/*.bin above. See voice-pipeline/README.md to (re)provision.
+voice-pipeline/.venv/
+voice-pipeline/models/*.onnx
+voice-pipeline/models/*.onnx.json
