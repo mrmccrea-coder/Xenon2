@@ -81,7 +81,7 @@ Tasks:
 
 ---
 
-## Phase 3 — Desktop Shell & Chat UI
+## Phase 3 — Desktop Shell & Chat UI [x]
 
 **Depends on**: Phase 1 (text works standalone even before Phase 2 is done —
 UI work can start in parallel with Phase 2)
