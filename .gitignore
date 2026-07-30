@@ -1,0 +1,15 @@
+# CMake build output (both the CPU-only and CUDA rwkv.cpp builds, and the wrapper/app build dirs)
+build/
+build-cpu/
+build-cuda/
+build-cpu-app/
+build-cuda-app/
+
+# Large model files -- not intended to be committed to git. See inference-engine/README.md for
+# how to (re)download and (re)quantize models/ from scratch.
+models/*.pth
+models/*.bin
+
+# Python
+__pycache__/
+*.pyc
