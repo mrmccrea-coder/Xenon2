@@ -1,30 +1,23 @@
 <script setup lang="ts">
 // App.vue -- top-level layout: MenuBar on top, Sidebar + chat panel below (Phase 3 shell).
 //
-// Owns the in-memory conversation state (real persistence is Phase 5's job). Wires
-// MessageInput's "send" event through the `generate_response` Tauri command and listens for the
-// `token-stream` / `generation-done` / `generation-error` events the Rust backend emits while it
-// streams Phase 1's inference engine output back token-by-token.
+// As of Phase 4, conversation/message state lives in the Pinia store (`stores/chat.ts`), not in
+// local refs -- this component reads/writes through `useChatStore()`. It still owns Tauri
+// event-listener registration and DOM-only concerns (scroll-to-bottom) that don't belong in a
+// store. Token/done/error events from the `generate_response` Tauri command are forwarded
+// straight into the matching store actions, which know how to find the right message (by id, not
+// by array position) to update.
 
-import { onMounted, onUnmounted, ref, computed } from "vue";
-import { invoke } from "@tauri-apps/api/core";
+import { onMounted, onUnmounted, ref } from "vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 import MenuBar from "./components/MenuBar.vue";
 import Sidebar from "./components/Sidebar.vue";
 import ChatMessageVue from "./components/ChatMessage.vue";
 import MessageInput from "./components/MessageInput.vue";
-import type { Conversation, ChatMessage } from "./types";
-import { newId } from "./types";
+import { useChatStore } from "./stores/chat";
 
-const conversations = ref<Conversation[]>([]);
-const activeId = ref<string | null>(null);
-const generating = ref(false);
-const backendError = ref<string | null>(null);
-
-const activeConversation = computed<Conversation | null>(
-  () => conversations.value.find((c) => c.id === activeId.value) ?? null
-);
+const store = useChatStore();
 
 const messagesContainer = ref<HTMLElement | null>(null);
 
@@ -35,104 +28,82 @@ function scrollToBottom() {
   });
 }
 
-/** Starts a fresh, empty conversation and makes it active. Used by both "+ New Chat" (Sidebar)
- * and File > New (MenuBar) -- the one file-menu item that's actually functional this phase. */
 function newChat() {
-  const convo: Conversation = {
-    id: newId(),
-    title: "New Chat",
-    createdAt: Date.now(),
-    messages: [],
-  };
-  conversations.value.unshift(convo);
-  activeId.value = convo.id;
-  backendError.value = null;
+  store.newChat();
+  scrollToBottom();
 }
 
 function selectConversation(id: string) {
-  activeId.value = id;
-  backendError.value = null;
+  store.selectConversation(id);
+  scrollToBottom();
+}
+
+// Phase 5: File > Open / Save / Save As. MenuBar just emits; the store owns the actual Tauri
+// dialog + filesystem calls (see stores/chat.ts). Errors surface via store.fileError, rendered in
+// the banner below rather than a native alert() so it matches the existing backendError banner.
+async function openConversation() {
+  await store.openConversation();
+  scrollToBottom();
+}
+
+async function saveConversation() {
+  const id = store.activeConversation?.id;
+  if (!id) return;
+  await store.saveConversation(id);
+}
+
+async function saveConversationAs() {
+  const id = store.activeConversation?.id;
+  if (!id) return;
+  await store.saveConversationAs(id);
 }
 
 async function sendMessage(text: string) {
-  if (!activeConversation.value) {
-    newChat();
-  }
-  const convo = activeConversation.value!;
-  if (convo.title === "New Chat" || !convo.title) {
-    convo.title = text.length > 40 ? text.slice(0, 40) + "..." : text;
-  }
-
-  const userMsg: ChatMessage = { id: newId(), role: "user", content: text };
-  const assistantMsg: ChatMessage = { id: newId(), role: "assistant", content: "", streaming: true };
-  convo.messages.push(userMsg);
-  convo.messages.push(assistantMsg);
   scrollToBottom();
+  await store.sendMessage(text);
+  scrollToBottom();
+}
 
-  const conversationId = convo.id;
-  const history = convo.messages
-    .filter((m) => m.id !== assistantMsg.id)
-    .map((m) => ({ role: m.role, content: m.content }));
+async function editMessage(messageId: string, newText: string) {
+  const conversationId = store.activeConversation?.id;
+  if (!conversationId) return;
+  scrollToBottom();
+  await store.editUserMessage(conversationId, messageId, newText);
+  scrollToBottom();
+}
 
-  generating.value = true;
-  backendError.value = null;
-
-  try {
-    await invoke("generate_response", { conversationId, history });
-  } catch (err) {
-    generating.value = false;
-    assistantMsg.streaming = false;
-    assistantMsg.errored = true;
-    assistantMsg.content = `(failed to reach inference engine: ${String(err)})`;
-    backendError.value = String(err);
-  }
+async function regenerateMessage(messageId: string) {
+  const conversationId = store.activeConversation?.id;
+  if (!conversationId) return;
+  await store.regenerateAssistantMessage(conversationId, messageId);
+  scrollToBottom();
 }
 
 let unlistenToken: UnlistenFn | null = null;
 let unlistenDone: UnlistenFn | null = null;
 let unlistenError: UnlistenFn | null = null;
 
-function findStreamingAssistantMessage(conversationId: string): ChatMessage | null {
-  const convo = conversations.value.find((c) => c.id === conversationId);
-  if (!convo) return null;
-  // Streaming assistant message is always the last one while generation is in flight.
-  const last = convo.messages[convo.messages.length - 1];
-  return last && last.role === "assistant" && last.streaming ? last : null;
-}
-
 onMounted(async () => {
+  // Phase 5: fetch the backend's actually-loaded model name first (so any conversation created
+  // or loaded afterwards has a real fallback value -- see store.newChat/autoSave), then restore
+  // the last session (sidebar + last-active conversation) before wiring up generation events.
+  await store.initModelName();
+  await store.restoreSession();
+  scrollToBottom();
+
   unlistenToken = await listen<{ conversationId: string; text: string }>("token-stream", (event) => {
-    const msg = findStreamingAssistantMessage(event.payload.conversationId);
-    if (msg) {
-      msg.content += event.payload.text;
-      scrollToBottom();
-    }
+    store.appendToken(event.payload.conversationId, event.payload.text);
+    scrollToBottom();
   });
 
   unlistenDone = await listen<{ conversationId: string }>("generation-done", (event) => {
-    const msg = findStreamingAssistantMessage(event.payload.conversationId);
-    if (msg) {
-      msg.streaming = false;
-      // The Rust backend's stop-sequence check (mirroring Phase 1's CLI harness) stops
-      // generation as soon as the model starts a new "User:" turn, but by then that
-      // stop-sequence text has already been streamed and appended -- strip it here so the
-      // bubble shows only Xenon's actual reply, not the start of a fake next turn.
-      msg.content = msg.content.replace(/\n+\s*[Uu]ser:\s*$/, "").trimEnd();
-    }
-    generating.value = false;
+    store.completeGeneration(event.payload.conversationId);
   });
 
   unlistenError = await listen<{ conversationId: string; message: string }>(
     "generation-error",
     (event) => {
-      const msg = findStreamingAssistantMessage(event.payload.conversationId);
-      if (msg) {
-        msg.streaming = false;
-        msg.errored = true;
-        if (!msg.content) msg.content = `(inference error: ${event.payload.message})`;
-      }
-      backendError.value = event.payload.message;
-      generating.value = false;
+      store.failGeneration(event.payload.conversationId, event.payload.message);
     }
   );
 });
@@ -146,18 +117,24 @@ onUnmounted(() => {
 
 <template>
   <div class="app-shell">
-    <MenuBar @new="newChat" />
+    <MenuBar
+      :has-active-conversation="!!store.activeConversation"
+      @new="newChat"
+      @open="openConversation"
+      @save="saveConversation"
+      @save-as="saveConversationAs"
+    />
 
     <div class="body">
       <Sidebar
-        :conversations="conversations"
-        :active-id="activeId"
+        :conversations="store.conversations"
+        :active-id="store.activeId"
         @new-chat="newChat"
         @select="selectConversation"
       />
 
       <main class="chat-panel">
-        <div v-if="!activeConversation" class="empty-state">
+        <div v-if="!store.activeConversation" class="empty-state">
           <p>No conversation selected.</p>
           <p class="hint">Type a message below, or click "+ New Chat" to get started.</p>
         </div>
@@ -165,16 +142,23 @@ onUnmounted(() => {
         <template v-else>
           <div ref="messagesContainer" class="messages">
             <ChatMessageVue
-              v-for="m in activeConversation.messages"
+              v-for="m in store.activeConversation.messages"
               :key="m.id"
               :message="m"
+              :disabled="store.generating"
+              @edit="(newText) => editMessage(m.id, newText)"
+              @regenerate="() => regenerateMessage(m.id)"
             />
           </div>
         </template>
 
-        <div v-if="backendError" class="error-banner">{{ backendError }}</div>
+        <div v-if="store.backendError" class="error-banner">{{ store.backendError }}</div>
+        <div v-if="store.fileError" class="error-banner file-error">
+          {{ store.fileError }}
+          <button class="dismiss-btn" title="Dismiss" @click="store.fileError = null">✕</button>
+        </div>
 
-        <MessageInput :disabled="generating" @send="sendMessage" />
+        <MessageInput :disabled="store.generating" @send="sendMessage" />
       </main>
     </div>
   </div>
@@ -233,6 +217,23 @@ onUnmounted(() => {
   color: #ffd6d6;
   border-radius: 6px;
   font-size: 0.8rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.error-banner.file-error {
+  margin-top: 0.4rem;
+}
+
+.dismiss-btn {
+  background: none;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  font-size: 0.8rem;
+  flex-shrink: 0;
 }
 </style>
 

@@ -1,53 +1,108 @@
 <script setup lang="ts">
 // ChatMessage.vue -- one message bubble (user or assistant).
 //
-// Scope boundary (see prompts/phase3_prompt.md): edit/delete (user) and regenerate (assistant)
-// icons must be visually present and clickable, but their real behavior -- editing a message,
-// truncating conversation history, re-running generate() -- is Phase 4's job. Here they are
-// no-op console.log stubs on purpose; do not wire up real logic.
+// Phase 4: edit (user messages) and regenerate (assistant messages) are now real -- clicking edit
+// swaps the bubble into an editable textarea; confirming emits `edit` with the new text, and
+// App.vue/the Pinia store handle the truncate + re-generate flow. Regenerate just emits
+// `regenerate` and the store replaces that one message's content in place.
+//
+// Delete remains an intentional stub -- see prompts/phase4_prompt.md's explicit scope note: it's
+// a real gap in PLAN.md's Phase 4 task list, not something this phase silently fixes. Do not wire
+// up real delete logic here.
 
+import { ref } from "vue";
 import type { ChatMessage } from "../types";
 
 const props = defineProps<{
   message: ChatMessage;
+  /** True while any generation is in flight app-wide -- disables edit-confirm/regenerate so a
+   * second generate_response call can't race the one already running. */
+  disabled?: boolean;
 }>();
 
-function stubEdit() {
-  console.log(
-    `[ChatMessage] Edit clicked for message ${props.message.id} -- stub only, real editing/` +
-      `truncation logic is Phase 4's job.`
-  );
+const emit = defineEmits<{
+  (e: "edit", newText: string): void;
+  (e: "regenerate"): void;
+}>();
+
+const isEditing = ref(false);
+const draft = ref("");
+
+function startEdit() {
+  if (props.disabled) return;
+  draft.value = props.message.content;
+  isEditing.value = true;
+}
+
+function confirmEdit() {
+  const trimmed = draft.value.trim();
+  if (!trimmed || props.disabled) return;
+  emit("edit", trimmed);
+  isEditing.value = false;
+}
+
+function cancelEdit() {
+  isEditing.value = false;
+  draft.value = props.message.content;
+}
+
+function onEditKeydown(e: KeyboardEvent) {
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    confirmEdit();
+  } else if (e.key === "Escape") {
+    e.preventDefault();
+    cancelEdit();
+  }
+}
+
+function onRegenerate() {
+  if (props.disabled) return;
+  emit("regenerate");
 }
 
 function stubDelete() {
   console.log(
-    `[ChatMessage] Delete clicked for message ${props.message.id} -- stub only, real deletion ` +
-      `logic is Phase 4's job.`
-  );
-}
-
-function stubRegenerate() {
-  console.log(
-    `[ChatMessage] Regenerate clicked for message ${props.message.id} -- stub only, real ` +
-      `regenerate logic is Phase 4's job.`
+    `[ChatMessage] Delete clicked for message ${props.message.id} -- stub only. Real deletion ` +
+      `logic has no owning phase yet (see PLAN.md/phase4_prompt.md's explicit scope note); ` +
+      `Phase 4 intentionally left this un-wired.`
   );
 }
 </script>
 
 <template>
   <div class="row" :class="message.role">
-    <div class="bubble" :class="{ errored: message.errored }">
-      <div class="content">{{ message.content }}<span v-if="message.streaming" class="cursor">▍</span></div>
+    <div class="bubble" :class="{ errored: message.errored, editing: isEditing }">
+      <template v-if="isEditing">
+        <textarea
+          v-model="draft"
+          class="edit-box"
+          rows="2"
+          autofocus
+          @keydown="onEditKeydown"
+        ></textarea>
+        <div class="edit-actions">
+          <button class="edit-btn confirm" title="Confirm (Enter)" @click="confirmEdit">✓</button>
+          <button class="edit-btn cancel" title="Cancel (Esc)" @click="cancelEdit">✕</button>
+        </div>
+      </template>
 
-      <div class="icons">
-        <template v-if="message.role === 'user'">
-          <button class="icon-btn" title="Edit (stub)" @click="stubEdit">✎</button>
-          <button class="icon-btn" title="Delete (stub)" @click="stubDelete">🗑</button>
-        </template>
-        <template v-else>
-          <button class="icon-btn" title="Regenerate (stub)" @click="stubRegenerate">⟳</button>
-        </template>
-      </div>
+      <template v-else>
+        <div class="content">
+          {{ message.content }}<span v-if="message.streaming" class="cursor">▍</span>
+        </div>
+        <div v-if="message.edited" class="edited-tag">(edited)</div>
+
+        <div class="icons">
+          <template v-if="message.role === 'user'">
+            <button class="icon-btn" title="Edit" @click="startEdit">✎</button>
+            <button class="icon-btn" title="Delete (stub)" @click="stubDelete">🗑</button>
+          </template>
+          <template v-else>
+            <button class="icon-btn" title="Regenerate" @click="onRegenerate">⟳</button>
+          </template>
+        </div>
+      </template>
     </div>
   </div>
 </template>
@@ -78,6 +133,11 @@ function stubRegenerate() {
   word-break: break-word;
 }
 
+.bubble.editing {
+  max-width: 85%;
+  width: 70%;
+}
+
 .row.user .bubble {
   background: #2f6feb;
   color: #fff;
@@ -104,6 +164,58 @@ function stubRegenerate() {
   50% {
     opacity: 0;
   }
+}
+
+.edited-tag {
+  margin-top: 0.15rem;
+  font-size: 0.7rem;
+  opacity: 0.7;
+  font-style: italic;
+}
+
+.edit-box {
+  width: 100%;
+  resize: vertical;
+  min-height: 2.6rem;
+  padding: 0.4rem 0.5rem;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  background: rgba(0, 0, 0, 0.2);
+  color: inherit;
+  font: inherit;
+  box-sizing: border-box;
+}
+
+.edit-box:focus {
+  outline: none;
+  border-color: rgba(255, 255, 255, 0.55);
+}
+
+.edit-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.35rem;
+  margin-top: 0.35rem;
+}
+
+.edit-btn {
+  border: none;
+  border-radius: 5px;
+  width: 1.6rem;
+  height: 1.6rem;
+  font-size: 0.8rem;
+  cursor: pointer;
+  line-height: 1;
+  background: rgba(0, 0, 0, 0.35);
+  color: #fff;
+}
+
+.edit-btn.confirm:hover {
+  background: #2f9e57;
+}
+
+.edit-btn.cancel:hover {
+  background: #b8402f;
 }
 
 .icons {

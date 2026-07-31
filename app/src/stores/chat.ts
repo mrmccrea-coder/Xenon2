@@ -1,0 +1,444 @@
+// stores/chat.ts -- Phase 4's Pinia store, extended in Phase 5 with on-disk persistence. Single
+// source of truth for conversation/message state, replacing the plain refs App.vue used to own
+// directly (Phase 3). App.vue still owns Tauri event-listener registration and DOM concerns
+// (scrolling) -- it just calls into this store instead of mutating local refs.
+//
+// Key design point for edit/regenerate: rather than assuming "the streaming message is always the
+// last message in the array" (true for a brand-new send, but NOT true for a regenerate targeting
+// an earlier assistant message), this store tracks which message id is currently streaming per
+// conversation (`streamingMessageIds`). Token/done/error handlers look the target message up by
+// id, so regenerating message #2 in a 5-message conversation updates message #2 in place no
+// matter what -- it never touches messages #1, #3, #4, #5.
+//
+// Scope note: delete is intentionally NOT implemented here. See ChatMessage.vue's `stubDelete`
+// and app/README.md -- Phase 4's spec explicitly leaves it a stub (real gap in PLAN.md's task
+// list, not an oversight).
+//
+// Phase 5 persistence model (see SCHEMA.md and app/README.md's "Auto-save default path policy"
+// for the full writeup):
+// - `filePaths[conversationId]` records the last path a conversation was written to, whether that
+//   came from an explicit Save/Save As or from auto-save picking a default location. Once a path
+//   exists, both "Save" and auto-save reuse it silently -- only "Save As" (or a brand-new
+//   conversation's first auto-save) needs a dialog or default-path decision.
+// - Auto-save runs from `completeGeneration` only (a *successful* completed generation), never
+//   from `failGeneration` -- an errored placeholder isn't real generated content worth persisting
+//   as the conversation's saved state.
+// - `session.json` (app-data dir) remembers `lastActiveConversationId` + `conversationPaths` so
+//   relaunching the app can silently reload the last-active conversation (and every other known
+//   conversation into the sidebar) without the user clicking Open.
+
+import { defineStore } from "pinia";
+import { invoke } from "@tauri-apps/api/core";
+import type { Conversation, ChatMessage } from "../types";
+import { newId } from "../types";
+import {
+  toConversationFile,
+  fromConversationFile,
+  suggestFileName,
+  type ConversationFile,
+  type SessionFile,
+} from "../persistence";
+
+interface ChatState {
+  conversations: Conversation[];
+  activeId: string | null;
+  /** True whenever a generate_response call is in flight (send, edit, or regenerate). Backend
+   * serializes all generation through a single mutex anyway (see inference.rs), so one app-wide
+   * flag -- rather than one per conversation -- is sufficient to prevent overlapping calls and
+   * matches what MessageInput already disabled on during Phase 3. */
+  generating: boolean;
+  /** conversationId -> id of the message currently being streamed into. Populated right before a
+   * generate_response call, consulted by the token/done/error event handlers, cleared once that
+   * generation finishes or errors. */
+  streamingMessageIds: Record<string, string>;
+  backendError: string | null;
+  /** conversationId -> absolute path last written for that conversation (see file header). */
+  filePaths: Record<string, string>;
+  /** Name/version of the model actually loaded by the backend (fetched once at startup via the
+   * `get_model_name` Tauri command) -- recorded into every conversation's `model` field so a
+   * saved file always says which model generated it. */
+  modelName: string;
+  /** Message from the most recent failed Save/Save As/Open, or null. Separate from
+   * `backendError` (inference errors) since these are a different failure domain (file I/O /
+   * validation), surfaced in their own banner. */
+  fileError: string | null;
+  /** True once `restoreSession` has run (successfully or not) so App.vue knows startup restore
+   * is done and it's safe to render the normal empty-state UI instead of a loading placeholder. */
+  sessionRestored: boolean;
+}
+
+export const useChatStore = defineStore("chat", {
+  state: (): ChatState => ({
+    conversations: [],
+    activeId: null,
+    generating: false,
+    streamingMessageIds: {},
+    backendError: null,
+    filePaths: {},
+    modelName: "unknown-model",
+    fileError: null,
+    sessionRestored: false,
+  }),
+
+  getters: {
+    activeConversation(state): Conversation | null {
+      return state.conversations.find((c) => c.id === state.activeId) ?? null;
+    },
+  },
+
+  actions: {
+    findConversation(conversationId: string): Conversation | null {
+      return this.conversations.find((c) => c.id === conversationId) ?? null;
+    },
+
+    /** Starts a fresh, empty conversation and makes it active. Used by both "+ New Chat"
+     * (Sidebar) and File > New (MenuBar). */
+    newChat(): void {
+      const convo: Conversation = {
+        id: newId(),
+        title: "New Chat",
+        createdAt: Date.now(),
+        messages: [],
+        model: this.modelName,
+      };
+      this.conversations.unshift(convo);
+      this.activeId = convo.id;
+      this.backendError = null;
+      this.fileError = null;
+      void this.persistSession();
+    },
+
+    selectConversation(id: string): void {
+      this.activeId = id;
+      this.backendError = null;
+      this.fileError = null;
+      void this.persistSession();
+    },
+
+    /** Fetches the backend's actually-loaded model name once at startup. Called from App.vue
+     * before `restoreSession` so new conversations created afterwards (or ones loaded without a
+     * `model` field) have a real value to fall back on. */
+    async initModelName(): Promise<void> {
+      try {
+        this.modelName = await invoke<string>("get_model_name");
+      } catch (err) {
+        console.warn("[chat store] could not fetch model name:", err);
+      }
+    },
+
+    /** Writes session.json (lastActiveConversationId + filePaths) so a relaunch can restore
+     * state. Fire-and-forget from the caller's perspective -- a failure here (e.g. disk full)
+     * only affects "restore on next launch", not the user's current session, so it's logged, not
+     * surfaced as a blocking error. */
+    async persistSession(): Promise<void> {
+      const session: SessionFile = {
+        lastActiveConversationId: this.activeId,
+        conversationPaths: { ...this.filePaths },
+      };
+      try {
+        await invoke("save_session_file", { session });
+      } catch (err) {
+        console.warn("[chat store] could not persist session.json:", err);
+      }
+    },
+
+    /** Runs once at app startup (App.vue's onMounted). Loads session.json, reads every
+     * conversation it points to back off disk, populates the sidebar, and restores whichever
+     * conversation was last active -- all without the user clicking Open. A conversation file
+     * that fails to load (deleted/corrupted since last run) is skipped with a console warning
+     * rather than blocking the rest of startup. */
+    async restoreSession(): Promise<void> {
+      try {
+        const session = await invoke<SessionFile>("load_session_file");
+        const loaded: Conversation[] = [];
+        const paths: Record<string, string> = {};
+
+        for (const [conversationId, path] of Object.entries(session.conversationPaths ?? {})) {
+          try {
+            const file = await invoke<ConversationFile>("open_conversation_file", { path });
+            loaded.push(fromConversationFile(file));
+            paths[conversationId] = path;
+          } catch (err) {
+            console.warn(`[chat store] skipping conversation at '${path}' (failed to load):`, err);
+          }
+        }
+
+        loaded.sort((a, b) => b.createdAt - a.createdAt);
+        this.conversations = loaded;
+        this.filePaths = paths;
+
+        if (session.lastActiveConversationId && paths[session.lastActiveConversationId]) {
+          this.activeId = session.lastActiveConversationId;
+        } else {
+          this.activeId = null;
+        }
+      } catch (err) {
+        // First-ever launch (no session.json yet) or a genuine read failure -- either way, start
+        // with an empty sidebar rather than blocking the app from opening.
+        console.warn("[chat store] no session to restore (or failed to load):", err);
+      } finally {
+        this.sessionRestored = true;
+      }
+    },
+
+    /** Shared by both auto-save and explicit Save: writes `convo` to `path` and records that path
+     * as the conversation's current file. Throws on failure so callers can decide how to surface
+     * it (auto-save logs; explicit Save/Save As sets `fileError`). */
+    async writeConversationTo(convo: Conversation, path: string): Promise<void> {
+      const file = toConversationFile(convo, this.modelName);
+      await invoke("save_conversation_file", { path, conversation: file });
+      this.filePaths[convo.id] = path;
+      await this.persistSession();
+    },
+
+    /** Auto-save: called after every successfully completed generation (send, edit-regeneration,
+     * or manual regenerate -- see `completeGeneration` below). If this conversation has never
+     * been saved anywhere yet, writes to the default app-data path
+     * (`<app-data-dir>/conversations/<id>.json`) instead of prompting -- see SCHEMA.md /
+     * app/README.md's "Auto-save default path policy" for why. Never surfaces a dialog and never
+     * blocks the UI on failure; a write error is logged and left for the user to notice via a
+     * manual Save attempt, since interrupting a just-finished reply with an error banner over a
+     * background auto-save would be worse than a quiet retry-on-next-turn. */
+    async autoSave(conversationId: string): Promise<void> {
+      const convo = this.findConversation(conversationId);
+      if (!convo) return;
+
+      try {
+        let path = this.filePaths[conversationId];
+        if (!path) {
+          path = await invoke<string>("default_conversation_path", { conversationId });
+        }
+        await this.writeConversationTo(convo, path);
+      } catch (err) {
+        console.warn(`[chat store] auto-save failed for conversation ${conversationId}:`, err);
+      }
+    },
+
+    /** File > Save. Reuses the conversation's known path if it has one (from a prior Save As or
+     * auto-save); otherwise behaves like Save As (no path to silently reuse yet). */
+    async saveConversation(conversationId: string): Promise<void> {
+      const convo = this.findConversation(conversationId);
+      if (!convo) return;
+      this.fileError = null;
+
+      const existingPath = this.filePaths[conversationId];
+      if (existingPath) {
+        try {
+          await this.writeConversationTo(convo, existingPath);
+        } catch (err) {
+          this.fileError = `Could not save: ${String(err)}`;
+        }
+        return;
+      }
+      await this.saveConversationAs(conversationId);
+    },
+
+    /** File > Save As. Always opens a native save dialog, even if a path already exists, and
+     * subsequent auto-saves for this conversation follow the newly chosen path afterwards. */
+    async saveConversationAs(conversationId: string): Promise<void> {
+      const convo = this.findConversation(conversationId);
+      if (!convo) return;
+      this.fileError = null;
+
+      try {
+        const path = await invoke<string | null>("pick_save_dialog", {
+          defaultFileName: suggestFileName(convo),
+        });
+        if (!path) return; // user cancelled
+        await this.writeConversationTo(convo, path);
+      } catch (err) {
+        this.fileError = `Could not save: ${String(err)}`;
+      }
+    },
+
+    /** File > Open. Opens a native file dialog, validates the chosen file against the schema
+     * (rejecting malformed/non-Xenon2 JSON with a clear message rather than crashing), and loads
+     * it into the store -- replacing any existing in-memory copy of the same conversation id,
+     * otherwise adding it to the sidebar. */
+    async openConversation(): Promise<void> {
+      this.fileError = null;
+      try {
+        const path = await invoke<string | null>("pick_open_dialog");
+        if (!path) return; // user cancelled
+
+        const file = await invoke<ConversationFile>("open_conversation_file", { path });
+        const convo = fromConversationFile(file);
+
+        const existingIdx = this.conversations.findIndex((c) => c.id === convo.id);
+        if (existingIdx !== -1) {
+          this.conversations[existingIdx] = convo;
+        } else {
+          this.conversations.unshift(convo);
+        }
+        this.filePaths[convo.id] = path;
+        this.activeId = convo.id;
+        await this.persistSession();
+      } catch (err) {
+        // Covers both a cancelled/failed dialog and a malformed file -- either way, the user sees
+        // a clear message, the store's existing state is untouched (nothing was replaced before
+        // this catch), and the app keeps running normally.
+        this.fileError = `Could not open file: ${String(err)}`;
+      }
+    },
+
+    /** Kicks off a generate_response call against `history` (everything up through the newly
+     * pushed/edited user turn), streaming its reply into `assistantMsg`. Shared by sendMessage
+     * and editUserMessage -- the only difference between them is how the history/target message
+     * were set up beforehand. */
+    async runGeneration(
+      conversationId: string,
+      assistantMsg: ChatMessage,
+      history: { role: string; content: string }[]
+    ): Promise<void> {
+      this.streamingMessageIds[conversationId] = assistantMsg.id;
+      this.generating = true;
+      this.backendError = null;
+
+      try {
+        await invoke("generate_response", { conversationId, history });
+      } catch (err) {
+        this.generating = false;
+        delete this.streamingMessageIds[conversationId];
+        assistantMsg.streaming = false;
+        assistantMsg.errored = true;
+        assistantMsg.content = `(failed to reach inference engine: ${String(err)})`;
+        this.backendError = String(err);
+      }
+    },
+
+    /** Normal send flow: append a user message + a new empty streaming assistant message, then
+     * generate a reply from the full history. */
+    async sendMessage(text: string): Promise<void> {
+      if (this.generating) return;
+      if (!this.activeConversation) {
+        this.newChat();
+      }
+      const convo = this.activeConversation!;
+      if (convo.title === "New Chat" || !convo.title) {
+        convo.title = text.length > 40 ? text.slice(0, 40) + "..." : text;
+      }
+
+      const userMsg: ChatMessage = {
+        id: newId(),
+        role: "user",
+        content: text,
+        timestamp: Date.now(),
+      };
+      const assistantMsg: ChatMessage = {
+        id: newId(),
+        role: "assistant",
+        content: "",
+        streaming: true,
+        timestamp: Date.now(),
+      };
+      convo.messages.push(userMsg);
+      convo.messages.push(assistantMsg);
+
+      const history = convo.messages
+        .filter((m) => m.id !== assistantMsg.id)
+        .map((m) => ({ role: m.role, content: m.content }));
+
+      await this.runGeneration(convo.id, assistantMsg, history);
+    },
+
+    /** Edit an earlier user message: truncate everything after it, update its content, and
+     * regenerate a fresh assistant reply from the edited text. */
+    async editUserMessage(conversationId: string, messageId: string, newText: string): Promise<void> {
+      if (this.generating) return;
+      const convo = this.findConversation(conversationId);
+      if (!convo) return;
+
+      const idx = convo.messages.findIndex((m) => m.id === messageId);
+      if (idx === -1 || convo.messages[idx].role !== "user") return;
+
+      // Drop everything after the edited message (its old reply + anything past it).
+      convo.messages.splice(idx + 1);
+
+      const editedMsg = convo.messages[idx];
+      editedMsg.content = newText;
+      editedMsg.edited = true;
+
+      const assistantMsg: ChatMessage = {
+        id: newId(),
+        role: "assistant",
+        content: "",
+        streaming: true,
+        timestamp: Date.now(),
+      };
+      convo.messages.push(assistantMsg);
+
+      const history = convo.messages
+        .filter((m) => m.id !== assistantMsg.id)
+        .map((m) => ({ role: m.role, content: m.content }));
+
+      await this.runGeneration(convo.id, assistantMsg, history);
+    },
+
+    /** Regenerate one assistant message in place: rebuild history up to (not including) it, clear
+     * just that message's content, and stream a new reply into it -- every other message in the
+     * conversation, before or after, is left untouched. */
+    async regenerateAssistantMessage(conversationId: string, messageId: string): Promise<void> {
+      if (this.generating) return;
+      const convo = this.findConversation(conversationId);
+      if (!convo) return;
+
+      const idx = convo.messages.findIndex((m) => m.id === messageId);
+      if (idx === -1 || convo.messages[idx].role !== "assistant") return;
+
+      const history = convo.messages
+        .slice(0, idx)
+        .map((m) => ({ role: m.role, content: m.content }));
+
+      const targetMsg = convo.messages[idx];
+      targetMsg.content = "";
+      targetMsg.streaming = true;
+      targetMsg.errored = false;
+      targetMsg.timestamp = Date.now();
+
+      await this.runGeneration(convo.id, targetMsg, history);
+    },
+
+    // --- Tauri event handlers (called from App.vue's listen() callbacks) ---
+
+    appendToken(conversationId: string, text: string): void {
+      const messageId = this.streamingMessageIds[conversationId];
+      if (!messageId) return;
+      const msg = this.findConversation(conversationId)?.messages.find((m) => m.id === messageId);
+      if (msg) msg.content += text;
+    },
+
+    completeGeneration(conversationId: string): void {
+      const messageId = this.streamingMessageIds[conversationId];
+      const msg = this.findConversation(conversationId)?.messages.find((m) => m.id === messageId);
+      if (msg) {
+        msg.streaming = false;
+        // The Rust backend's stop-sequence check stops generation as soon as the model starts a
+        // new "User:" turn, but that stop-sequence text has already been streamed and appended --
+        // strip it here so the bubble shows only Xenon's actual reply.
+        msg.content = msg.content.replace(/\n+\s*[Uu]ser:\s*$/, "").trimEnd();
+      }
+      delete this.streamingMessageIds[conversationId];
+      this.generating = false;
+
+      // Phase 5 auto-save: every completed exchange (send, edit-regeneration, or manual
+      // regenerate all funnel through here) gets written to disk so a crash can't lose history.
+      // Deliberately NOT awaited -- completeGeneration is called synchronously from App.vue's
+      // event listener and shouldn't block the UI on a disk write; autoSave handles its own
+      // errors internally (see its doc comment).
+      void this.autoSave(conversationId);
+    },
+
+    failGeneration(conversationId: string, message: string): void {
+      const messageId = this.streamingMessageIds[conversationId];
+      const msg = this.findConversation(conversationId)?.messages.find((m) => m.id === messageId);
+      if (msg) {
+        msg.streaming = false;
+        msg.errored = true;
+        if (!msg.content) msg.content = `(inference error: ${message})`;
+      }
+      delete this.streamingMessageIds[conversationId];
+      this.backendError = message;
+      this.generating = false;
+    },
+  },
+});

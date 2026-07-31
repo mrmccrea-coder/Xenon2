@@ -112,7 +112,7 @@ Tasks:
 
 ---
 
-## Phase 4 — Message Editing & Regeneration
+## Phase 4 — Message Editing & Regeneration [x]
 
 **Depends on**: Phase 3
 
@@ -135,7 +135,7 @@ Tasks:
 
 ---
 
-## Phase 5 — Project File Save/Load
+## Phase 5 — Project File Save/Load [x]
 
 **Depends on**: Phase 4 (needs the conversation data model finalized)
 

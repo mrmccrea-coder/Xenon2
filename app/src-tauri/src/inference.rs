@@ -57,15 +57,32 @@ unsafe impl Send for EnginePtr {}
 #[derive(Clone)]
 pub struct EngineState(pub Arc<Mutex<EnginePtr>>);
 
+/// The loaded model's name/version (its filename, minus extension, e.g.
+/// `"rwkv-5-world-0.4B-Q4_0"`), recorded so Phase 5's saved conversation files can note which
+/// model generated them (see `persistence::ConversationFile::model`). Computed once from the
+/// actual path `load_engine` loads, so it can never drift from what's really running.
+pub struct ModelInfo(pub String);
+
+#[tauri::command]
+pub fn get_model_name(model_info: tauri::State<'_, ModelInfo>) -> String {
+    model_info.0.clone()
+}
+
 /// Loads the Phase 1 model once at app startup. Panics (fails app startup) rather than silently
 /// falling back to a stub -- per the phase spec, this app must call the real inference engine,
-/// not reimplement or fake it.
-pub fn load_engine(repo_root: &PathBuf) -> EngineState {
+/// not reimplement or fake it. Also returns a `ModelInfo` derived from the same path, so the name
+/// recorded in saved conversation files (Phase 5) can never drift from what's actually loaded.
+pub fn load_engine(repo_root: &PathBuf) -> (EngineState, ModelInfo) {
     let model_path = repo_root.join("models").join("rwkv-5-world-0.4B-Q4_0.bin");
     let vocab_path = repo_root
         .join("inference-engine")
         .join("data")
         .join("world_vocab.bin");
+
+    let model_name = model_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown-model".to_string());
 
     let model_path_c = CString::new(model_path.to_string_lossy().as_bytes())
         .expect("model path contains NUL byte");
@@ -87,7 +104,10 @@ pub fn load_engine(repo_root: &PathBuf) -> EngineState {
         );
     }
 
-    EngineState(Arc::new(Mutex::new(EnginePtr(engine))))
+    (
+        EngineState(Arc::new(Mutex::new(EnginePtr(engine)))),
+        ModelInfo(model_name),
+    )
 }
 
 fn last_error() -> String {

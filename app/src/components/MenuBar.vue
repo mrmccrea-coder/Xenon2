@@ -1,15 +1,24 @@
 <script setup lang="ts">
 // MenuBar.vue -- File menu.
 //
-// Scope boundary (see prompts/phase3_prompt.md): only "New" is functional this phase. Open /
-// Save / Save As / Export Memory are intentional visual stubs -- their real logic belongs to
-// Phase 5 (file save/load) and Phase 6 (external memory export), not here. Clicking them just
-// logs to the console so it's easy to confirm in devtools that nothing silently "works".
+// Phase 5: Open / Save / Save As are now real (see stores/chat.ts's openConversation /
+// saveConversation / saveConversationAs), wired the same way "New" already was -- this component
+// just emits, App.vue calls the store. Save / Save As are disabled when there's no active
+// conversation to save. Export Memory remains an intentional visual stub -- its real logic is
+// Phase 6's job, not this phase's.
 
 import { ref } from "vue";
 
+const props = defineProps<{
+  /** Disables Save / Save As when there's no active conversation. */
+  hasActiveConversation?: boolean;
+}>();
+
 const emit = defineEmits<{
   (e: "new"): void;
+  (e: "open"): void;
+  (e: "save"): void;
+  (e: "save-as"): void;
 }>();
 
 const fileMenuOpen = ref(false);
@@ -27,6 +36,23 @@ function onNew() {
   closeFileMenu();
 }
 
+function onOpen() {
+  emit("open");
+  closeFileMenu();
+}
+
+function onSave() {
+  if (!props.hasActiveConversation) return;
+  emit("save");
+  closeFileMenu();
+}
+
+function onSaveAs() {
+  if (!props.hasActiveConversation) return;
+  emit("save-as");
+  closeFileMenu();
+}
+
 // Intentional stub -- see file header. `feature` names the later phase that owns the real
 // behavior so it's obvious in devtools this isn't a bug, it's scope.
 function stub(item: string, phase: string) {
@@ -41,9 +67,21 @@ function stub(item: string, phase: string) {
       File
       <div v-if="fileMenuOpen" class="dropdown" @mousedown.prevent>
         <button class="dropdown-item" @click="onNew">New</button>
-        <button class="dropdown-item stub" @click="stub('Open', 'Phase 5')">Open...</button>
-        <button class="dropdown-item stub" @click="stub('Save', 'Phase 5')">Save</button>
-        <button class="dropdown-item stub" @click="stub('Save As', 'Phase 5')">Save As...</button>
+        <button class="dropdown-item" @click="onOpen">Open...</button>
+        <button
+          class="dropdown-item"
+          :class="{ disabled: !hasActiveConversation }"
+          @click="onSave"
+        >
+          Save
+        </button>
+        <button
+          class="dropdown-item"
+          :class="{ disabled: !hasActiveConversation }"
+          @click="onSaveAs"
+        >
+          Save As...
+        </button>
         <div class="dropdown-sep"></div>
         <button class="dropdown-item stub" @click="stub('Export Memory', 'Phase 6')">
           Export Memory...
@@ -109,6 +147,15 @@ function stub(item: string, phase: string) {
 
 .dropdown-item.stub {
   color: #aaa;
+}
+
+.dropdown-item.disabled {
+  color: #666;
+  cursor: default;
+}
+
+.dropdown-item.disabled:hover {
+  background: none;
 }
 
 .dropdown-sep {

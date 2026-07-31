@@ -1,7 +1,10 @@
-// Shared frontend types for Phase 3's chat UI.
+// Shared frontend types for the chat UI.
 //
-// Conversations are held purely in-memory for this phase (Sidebar.vue's job per the Phase 3
-// spec) -- real persistence to disk is Phase 5's job, not built here.
+// As of Phase 5, conversations are durable: the Pinia store (stores/chat.ts) still owns all
+// in-memory state, but it now serializes to/from disk via Tauri commands (src-tauri/src/
+// persistence.rs). The on-disk JSON shape is documented in SCHEMA.md at the repo root -- these
+// types are the in-memory counterpart, not identical field-for-field (see `model` below, and note
+// `streaming`/`errored` are UI-only and never persisted).
 
 export type Role = "user" | "assistant";
 
@@ -13,6 +16,15 @@ export interface ChatMessage {
   streaming?: boolean;
   /** True if generation ended in an error (message.content holds the error text). */
   errored?: boolean;
+  /** True once a user message has been edited via the Phase 4 edit flow. Assistant messages
+   * don't use this -- a regenerated assistant message just gets new content, not an "edited"
+   * badge (there's no original-vs-edited distinction to show for a replaced reply). */
+  edited?: boolean;
+  /** Epoch ms when this message was created. Set once at creation and left alone afterwards
+   * (including on edit) -- it records when the turn was first created, not last touched.
+   * Regenerating an assistant message's content does update this, since regeneration produces an
+   * effectively new reply at a new point in time. */
+  timestamp: number;
 }
 
 export interface Conversation {
@@ -20,6 +32,13 @@ export interface Conversation {
   title: string;
   createdAt: number; // epoch ms, used for Today/Yesterday/Older grouping
   messages: ChatMessage[];
+  /** Name/version of the model this conversation was generated with, e.g.
+   * "rwkv-5-world-0.4B-Q4_0" (see SCHEMA.md). Set from the backend's actually-loaded model as
+   * soon as the conversation is created; only absent for conversations from a version of Xenon2
+   * that predates this field (loading such a file would be unusual since Phase 5 is the first
+   * phase with any on-disk format at all). Phase 5 does not validate this against the currently
+   * loaded model -- see phase5_prompt.md task 5. */
+  model?: string;
 }
 
 export function newId(): string {

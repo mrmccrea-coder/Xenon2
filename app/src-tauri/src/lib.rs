@@ -1,5 +1,6 @@
 mod ffi;
 mod inference;
+mod persistence;
 
 use std::path::PathBuf;
 use tauri::Manager;
@@ -21,12 +22,23 @@ pub fn run() {
                 .expect("repo root")
                 .to_path_buf();
 
-            let engine_state = inference::load_engine(&repo_root);
+            let (engine_state, model_info) = inference::load_engine(&repo_root);
             app.manage(engine_state);
+            app.manage(model_info);
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![inference::generate_response])
+        .invoke_handler(tauri::generate_handler![
+            inference::generate_response,
+            inference::get_model_name,
+            persistence::save_conversation_file,
+            persistence::open_conversation_file,
+            persistence::pick_save_dialog,
+            persistence::pick_open_dialog,
+            persistence::default_conversation_path,
+            persistence::load_session_file,
+            persistence::save_session_file,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
