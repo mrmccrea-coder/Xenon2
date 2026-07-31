@@ -132,8 +132,8 @@ cmake -B build-cuda-app -G "Visual Studio 17 2022" -A x64 `
 cmake --build build-cuda-app --config Release
 ```
 
-Each produces `build-<variant>-app/bin/Release/test_inference.exe` (with `rwkv.dll` copied
-alongside it automatically by the build).
+Each produces `build-<variant>-app/bin/Release/test_inference.exe` (with `rwkv.dll` and
+`world_vocab.bin` copied alongside it automatically by the build -- see "Follow-up fix" below).
 
 ## Getting a model
 
@@ -169,9 +169,47 @@ The World tokenizer vocab itself is already converted and checked in at
 `python tools/convert_world_vocab.py rwkv.cpp/python/rwkv_cpp/rwkv_vocab_v20230424.txt data/world_vocab.bin`
 if you ever need to.
 
+## Follow-up fix: self-contained build output folders (2026-07-31)
+
+Phase 1 was originally verified working, but only when run from the `Xenon2/` repo root, because
+`test_inference.cpp`'s default `--vocab` was a path relative to the current working directory
+(`inference-engine\data\world_vocab.bin`), and nothing copied that file into the build output
+folders. Running `test_inference.exe` directly from inside `build-cpu-app\bin\Release\` or
+`build-cuda-app\bin\Release\` (as a portable, self-contained build should support) failed with
+`WorldTokenizer: failed to open vocab file`.
+
+Fixed two places:
+- `CMakeLists.txt`: a second `add_custom_command(TARGET test_inference POST_BUILD ...)` now
+  copies `inference-engine/data/world_vocab.bin` next to `test_inference.exe` on every build,
+  alongside the existing `rwkv.dll` copy step -- no manual copy step to remember.
+- `test_inference.cpp`: the default vocab path is now resolved relative to the *executable's own
+  directory* (via `GetModuleFileNameA`/`get_exe_dir()`), not the current working directory or
+  the project root. `--vocab PATH` still overrides this explicitly if you want to point at a
+  different vocab file.
+
+Re-verified after the fix by running `test_inference.exe` directly from inside each build output
+folder, with no `cd` to the repo root and no `--vocab` flag:
+
+```powershell
+cd build-cpu-app\bin\Release
+.\test_inference.exe "hello, how are you?" --model "<repo>\models\rwkv-5-world-0.4B-Q4_0.bin" --max-tokens 30
+# -> loads and streams normally, no vocab-file error
+
+cd build-cuda-app\bin\Release
+.\test_inference.exe "hello, how are you?" --model "<repo>\models\rwkv-5-world-0.4B-Q4_0.bin" --gpu-layers 24 --max-tokens 30
+# -> loads and streams normally, no vocab-file error
+```
+
+Both build folders confirmed self-contained: `test_inference.exe`, `rwkv.dll`, and
+`world_vocab.bin` (plus the runtime DLLs already covered) are all present together in
+`build-cpu-app\bin\Release\` and `build-cuda-app\bin\Release\`, and the harness runs from either
+folder without any reliance on the working directory or project root.
+
 ## Running the CLI harness
 
-From the `Xenon2/` repo root (so the default relative model/vocab paths resolve):
+Can now be run either from the `Xenon2/` repo root, or directly from inside the build output
+folder itself (see the follow-up fix above) -- the default `--vocab` resolves relative to
+`test_inference.exe`'s own directory either way. From the repo root:
 
 ```powershell
 # CPU-only

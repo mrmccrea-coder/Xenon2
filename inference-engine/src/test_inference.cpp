@@ -24,6 +24,26 @@
 
 namespace {
 
+// Follow-up fix: the tokenizer's vocab file previously was only found when run with the
+// project root as the current working directory (default --vocab was a path relative to CWD).
+// world_vocab.bin is now copied next to test_inference.exe by CMake (see CMakeLists.txt), so
+// resolve the default vocab path relative to the *executable's own directory* instead, making
+// build-cpu-app/bin/Release and build-cuda-app/bin/Release self-contained/portable folders that
+// don't require cd'ing to the repo root first.
+std::string get_exe_dir() {
+#ifdef _WIN32
+    char buf[MAX_PATH];
+    DWORD len = GetModuleFileNameA(NULL, buf, MAX_PATH);
+    if (len == 0 || len == MAX_PATH) return "";
+    std::string path(buf, len);
+    size_t slash = path.find_last_of("\\/");
+    if (slash == std::string::npos) return "";
+    return path.substr(0, slash);
+#else
+    return "";
+#endif
+}
+
 size_t current_working_set_bytes() {
 #ifdef _WIN32
     PROCESS_MEMORY_COUNTERS pmc;
@@ -39,7 +59,10 @@ size_t current_working_set_bytes() {
 struct Args {
     std::string prompt;
     std::string model_path = "models\\rwkv-5-world-0.4B-Q4_0.bin";
-    std::string vocab_path = "inference-engine\\data\\world_vocab.bin";
+    // Left empty here and resolved in main() relative to the exe's own directory unless the
+    // user passes --vocab explicitly (see get_exe_dir() / vocab_path_explicit below).
+    std::string vocab_path;
+    bool vocab_path_explicit = false;
     uint32_t threads = 6;
     uint32_t gpu_layers = 0;
     int max_tokens = 100;
@@ -63,7 +86,7 @@ bool parse_args(int argc, char ** argv, Args & out) {
         };
 
         if (a == "--model") out.model_path = next("--model");
-        else if (a == "--vocab") out.vocab_path = next("--vocab");
+        else if (a == "--vocab") { out.vocab_path = next("--vocab"); out.vocab_path_explicit = true; }
         else if (a == "--threads") out.threads = static_cast<uint32_t>(std::stoul(next("--threads")));
         else if (a == "--gpu-layers") out.gpu_layers = static_cast<uint32_t>(std::stoul(next("--gpu-layers")));
         else if (a == "--max-tokens") out.max_tokens = std::stoi(next("--max-tokens"));
@@ -149,6 +172,17 @@ int main(int argc, char ** argv) {
             "[--gpu-layers N] [--max-tokens N] [--temperature F] [--top-p F] [--measure-memory] [--no-stop]\n",
             argc > 0 ? argv[0] : "test_inference");
         return 1;
+    }
+
+    if (!args.vocab_path_explicit) {
+        std::string exe_dir = get_exe_dir();
+        if (!exe_dir.empty()) {
+            args.vocab_path = exe_dir + "\\world_vocab.bin";
+        } else {
+            // Fallback if the exe's own directory couldn't be determined for some reason:
+            // same relative-to-project-root default as before the fix.
+            args.vocab_path = "inference-engine\\data\\world_vocab.bin";
+        }
     }
 
     fprintf(stderr, "xenon_inference: GPU support compiled in: %s\n", xenon_has_gpu_support() ? "yes" : "no");

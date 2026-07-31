@@ -35,7 +35,7 @@ location or directly off a USB/external drive with no install step.
 
 ---
 
-## Phase 1 — Inference Engine Core [x]
+## Phase 1 — Inference Engine Core [x] (vocab-file build fix applied 2026-07-31)
 
 **Depends on**: nothing (start here)
 

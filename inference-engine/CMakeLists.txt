@@ -52,6 +52,20 @@ add_custom_command(TARGET test_inference POST_BUILD
     COMMENT "Copying rwkv.dll next to test_inference.exe"
 )
 
+# Follow-up fix: world_vocab.bin (the World tokenizer's vocab file) must ship next to
+# test_inference.exe so the build output folder is self-contained and the .exe can be run
+# directly from build-cpu-app/bin/Release or build-cuda-app/bin/Release without depending on
+# the current working directory being the project root. Previously this was a manual copy step
+# nobody remembered to run; test_inference.cpp's default --vocab now also resolves relative to
+# the executable's own directory (see get_exe_dir() there), so this copy is what makes that
+# default actually resolve to a real file.
+add_custom_command(TARGET test_inference POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/data/world_vocab.bin"
+        "$<TARGET_FILE_DIR:test_inference>/world_vocab.bin"
+    COMMENT "Copying world_vocab.bin next to test_inference.exe"
+)
+
 # Extra runtime DLLs discovered as real, hard requirements while getting this to actually run
 # (not just build) on this machine -- best-effort app-local deployment so test_inference.exe
 # doesn't depend on PATH/registry state, which also matches this project's eventual
