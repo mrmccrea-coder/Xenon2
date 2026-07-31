@@ -19,6 +19,9 @@ const emit = defineEmits<{
   (e: "open"): void;
   (e: "save"): void;
   (e: "save-as"): void;
+  (e: "export-memory"): void;
+  (e: "import-memory"): void;
+  (e: "settings"): void;
 }>();
 
 const fileMenuOpen = ref(false);
@@ -53,10 +56,18 @@ function onSaveAs() {
   closeFileMenu();
 }
 
-// Intentional stub -- see file header. `feature` names the later phase that owns the real
-// behavior so it's obvious in devtools this isn't a bug, it's scope.
-function stub(item: string, phase: string) {
-  console.log(`[MenuBar] "${item}" is a Phase 3 visual stub -- real logic lands in ${phase}.`);
+function onExportMemory() {
+  emit("export-memory");
+  closeFileMenu();
+}
+
+function onImportMemory() {
+  emit("import-memory");
+  closeFileMenu();
+}
+
+function onSettings() {
+  emit("settings");
   closeFileMenu();
 }
 </script>
@@ -83,9 +94,10 @@ function stub(item: string, phase: string) {
           Save As...
         </button>
         <div class="dropdown-sep"></div>
-        <button class="dropdown-item stub" @click="stub('Export Memory', 'Phase 6')">
-          Export Memory...
-        </button>
+        <button class="dropdown-item" @click="onExportMemory">Export Memory...</button>
+        <button class="dropdown-item" @click="onImportMemory">Import Memory...</button>
+        <div class="dropdown-sep"></div>
+        <button class="dropdown-item" @click="onSettings">Data Directory Settings...</button>
       </div>
     </div>
   </div>

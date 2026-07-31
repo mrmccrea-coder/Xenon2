@@ -58,6 +58,47 @@ async function saveConversationAs() {
   await store.saveConversationAs(id);
 }
 
+// Phase 6: Export / Import Memory + data directory settings. MenuBar just emits; the store owns
+// the Tauri dialog + backend calls. Progress is rendered from store.memoryOp, populated by the
+// export-progress/import-progress event listeners registered below.
+async function exportMemory() {
+  await store.exportMemory();
+}
+
+async function importMemory() {
+  await store.importMemory();
+}
+
+const settingsOpen = ref(false);
+const settingsInput = ref("");
+
+function openSettings() {
+  settingsInput.value = store.dataDir ?? "";
+  settingsOpen.value = true;
+}
+
+async function pickDataDir() {
+  try {
+    const dir = await import("@tauri-apps/api/core").then((m) =>
+      m.invoke<string | null>("pick_folder_dialog", { testEnvVar: "XENON2_TEST_DATADIR_PICK_PATH" })
+    );
+    if (dir) settingsInput.value = dir;
+  } catch (err) {
+    console.warn("[App] folder pick failed:", err);
+  }
+}
+
+async function saveDataDirSetting() {
+  await store.setDataDir(settingsInput.value.trim() || null);
+  settingsOpen.value = false;
+}
+
+async function clearDataDirSetting() {
+  await store.setDataDir(null);
+  settingsInput.value = "";
+  settingsOpen.value = false;
+}
+
 async function sendMessage(text: string) {
   scrollToBottom();
   await store.sendMessage(text);
@@ -82,14 +123,51 @@ async function regenerateMessage(messageId: string) {
 let unlistenToken: UnlistenFn | null = null;
 let unlistenDone: UnlistenFn | null = null;
 let unlistenError: UnlistenFn | null = null;
+let unlistenExportProgress: UnlistenFn | null = null;
+let unlistenExportDone: UnlistenFn | null = null;
+let unlistenExportError: UnlistenFn | null = null;
+let unlistenImportProgress: UnlistenFn | null = null;
+let unlistenImportDone: UnlistenFn | null = null;
+let unlistenImportError: UnlistenFn | null = null;
+
+type MemoryProgressPayload = {
+  file: string;
+  fileIndex: number;
+  totalFiles: number;
+  bytesDone: number;
+  bytesTotal: number;
+};
+type MemoryDonePayload = { filesCopied: number; totalBytes: number };
+type MemoryErrorPayload = { message: string };
 
 onMounted(async () => {
   // Phase 5: fetch the backend's actually-loaded model name first (so any conversation created
   // or loaded afterwards has a real fallback value -- see store.newChat/autoSave), then restore
   // the last session (sidebar + last-active conversation) before wiring up generation events.
   await store.initModelName();
+  await store.loadDataDirSetting();
   await store.restoreSession();
   scrollToBottom();
+
+  // Phase 6: export/import progress events (see memory.rs's copy_with_progress).
+  unlistenExportProgress = await listen<MemoryProgressPayload>("export-progress", (event) => {
+    store.onMemoryProgress("export", event.payload);
+  });
+  unlistenExportDone = await listen<MemoryDonePayload>("export-done", (event) => {
+    store.onMemoryDone("export", event.payload);
+  });
+  unlistenExportError = await listen<MemoryErrorPayload>("export-error", (event) => {
+    store.onMemoryError("export", event.payload.message);
+  });
+  unlistenImportProgress = await listen<MemoryProgressPayload>("import-progress", (event) => {
+    store.onMemoryProgress("import", event.payload);
+  });
+  unlistenImportDone = await listen<MemoryDonePayload>("import-done", (event) => {
+    store.onMemoryDone("import", event.payload);
+  });
+  unlistenImportError = await listen<MemoryErrorPayload>("import-error", (event) => {
+    store.onMemoryError("import", event.payload.message);
+  });
 
   unlistenToken = await listen<{ conversationId: string; text: string }>("token-stream", (event) => {
     store.appendToken(event.payload.conversationId, event.payload.text);
@@ -112,6 +190,12 @@ onUnmounted(() => {
   unlistenToken?.();
   unlistenDone?.();
   unlistenError?.();
+  unlistenExportProgress?.();
+  unlistenExportDone?.();
+  unlistenExportError?.();
+  unlistenImportProgress?.();
+  unlistenImportDone?.();
+  unlistenImportError?.();
 });
 </script>
 
@@ -123,6 +207,9 @@ onUnmounted(() => {
       @open="openConversation"
       @save="saveConversation"
       @save-as="saveConversationAs"
+      @export-memory="exportMemory"
+      @import-memory="importMemory"
+      @settings="openSettings"
     />
 
     <div class="body">
@@ -160,6 +247,64 @@ onUnmounted(() => {
 
         <MessageInput :disabled="store.generating" @send="sendMessage" />
       </main>
+    </div>
+
+    <!-- Phase 6: export/import progress -->
+    <div v-if="store.memoryOp" class="modal-backdrop">
+      <div class="modal memory-modal">
+        <h3>{{ store.memoryOp.kind === "export" ? "Exporting Memory..." : "Importing Memory..." }}</h3>
+        <p class="memory-file">
+          File {{ store.memoryOp.fileIndex + 1 }} / {{ store.memoryOp.totalFiles || "?" }}:
+          {{ store.memoryOp.file }}
+        </p>
+        <div class="progress-bar">
+          <div
+            class="progress-fill"
+            :style="{
+              width:
+                store.memoryOp.bytesTotal > 0
+                  ? (store.memoryOp.bytesDone / store.memoryOp.bytesTotal) * 100 + '%'
+                  : '0%',
+            }"
+          ></div>
+        </div>
+        <p class="memory-bytes">
+          {{ (store.memoryOp.bytesDone / (1024 * 1024)).toFixed(1) }} MB /
+          {{ (store.memoryOp.bytesTotal / (1024 * 1024)).toFixed(1) }} MB
+        </p>
+      </div>
+    </div>
+
+    <div v-if="store.memoryMessage && !store.memoryOp" class="toast">
+      {{ store.memoryMessage }}
+      <button class="dismiss-btn" @click="store.memoryMessage = null">✕</button>
+    </div>
+    <div v-if="store.memoryError" class="toast toast-error">
+      {{ store.memoryError }}
+      <button class="dismiss-btn" @click="store.memoryError = null">✕</button>
+    </div>
+
+    <!-- Phase 6: data directory location settings -->
+    <div v-if="settingsOpen" class="modal-backdrop" @click.self="settingsOpen = false">
+      <div class="modal">
+        <h3>Data Directory Location</h3>
+        <p class="modal-hint">
+          When set, new conversations auto-save to and load from this folder's
+          <code>conversations/</code> subfolder instead of the local app-data default. Leave blank
+          to use the default location.
+        </p>
+        <div class="modal-row">
+          <input v-model="settingsInput" class="modal-input" placeholder="(local app-data default)" />
+          <button class="modal-btn" @click="pickDataDir">Browse...</button>
+        </div>
+        <p v-if="store.dataDir" class="modal-hint">Currently: {{ store.dataDir }}</p>
+        <p v-else class="modal-hint">Currently: local app-data default.</p>
+        <div class="modal-actions">
+          <button class="modal-btn" @click="clearDataDirSetting">Use Default</button>
+          <button class="modal-btn" @click="settingsOpen = false">Cancel</button>
+          <button class="modal-btn primary" @click="saveDataDirSetting">Save</button>
+        </div>
+      </div>
     </div>
   </div>
 </template>
@@ -234,6 +379,133 @@ onUnmounted(() => {
   cursor: pointer;
   font-size: 0.8rem;
   flex-shrink: 0;
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.modal {
+  background: #232325;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  padding: 1.25rem 1.5rem;
+  min-width: 320px;
+  max-width: 460px;
+  color: #eee;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
+}
+
+.modal h3 {
+  margin: 0 0 0.6rem;
+  font-size: 1rem;
+}
+
+.memory-file {
+  font-size: 0.8rem;
+  color: #aaa;
+  word-break: break-all;
+  margin: 0 0 0.6rem;
+}
+
+.progress-bar {
+  height: 8px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.1);
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  background: #5b8def;
+  transition: width 0.1s linear;
+}
+
+.memory-bytes {
+  font-size: 0.75rem;
+  color: #888;
+  margin: 0.5rem 0 0;
+  text-align: right;
+}
+
+.modal-hint {
+  font-size: 0.78rem;
+  color: #999;
+  margin: 0.3rem 0;
+}
+
+.modal-hint code {
+  color: #ccc;
+}
+
+.modal-row {
+  display: flex;
+  gap: 0.5rem;
+  margin: 0.6rem 0;
+}
+
+.modal-input {
+  flex: 1;
+  background: #1a1a1b;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 4px;
+  color: #eee;
+  padding: 0.4rem 0.5rem;
+  font-size: 0.85rem;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  margin-top: 1rem;
+}
+
+.modal-btn {
+  background: #33333a;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  color: #eee;
+  padding: 0.4rem 0.8rem;
+  border-radius: 6px;
+  font-size: 0.82rem;
+  cursor: pointer;
+}
+
+.modal-btn:hover {
+  background: #3d3d44;
+}
+
+.modal-btn.primary {
+  background: #5b8def;
+  border-color: #5b8def;
+  color: #fff;
+}
+
+.toast {
+  position: fixed;
+  bottom: 1.25rem;
+  right: 1.25rem;
+  background: #234a2e;
+  color: #d6ffe0;
+  padding: 0.6rem 0.9rem;
+  border-radius: 6px;
+  font-size: 0.82rem;
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  z-index: 110;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+}
+
+.toast-error {
+  background: #5a2323;
+  color: #ffd6d6;
 }
 </style>
 

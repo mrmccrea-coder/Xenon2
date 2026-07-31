@@ -65,6 +65,25 @@ interface ChatState {
   /** True once `restoreSession` has run (successfully or not) so App.vue knows startup restore
    * is done and it's safe to render the normal empty-state UI instead of a loading placeholder. */
   sessionRestored: boolean;
+
+  // --- Phase 6: export/import/settings ---
+  /** Non-null while an export or import is running; drives the progress modal in App.vue. */
+  memoryOp: MemoryOpState | null;
+  /** Message from the most recently finished export/import, shown briefly in the modal before it
+   * closes, or surfaced as an error. Separate from `fileError` -- a different failure domain. */
+  memoryMessage: string | null;
+  memoryError: string | null;
+  /** The persisted "data directory location" setting (`null` = using the local app-data default). */
+  dataDir: string | null;
+}
+
+export interface MemoryOpState {
+  kind: "export" | "import";
+  file: string;
+  fileIndex: number;
+  totalFiles: number;
+  bytesDone: number;
+  bytesTotal: number;
 }
 
 export const useChatStore = defineStore("chat", {
@@ -78,6 +97,10 @@ export const useChatStore = defineStore("chat", {
     modelName: "unknown-model",
     fileError: null,
     sessionRestored: false,
+    memoryOp: null,
+    memoryMessage: null,
+    memoryError: null,
+    dataDir: null,
   }),
 
   getters: {
@@ -439,6 +462,95 @@ export const useChatStore = defineStore("chat", {
       delete this.streamingMessageIds[conversationId];
       this.backendError = message;
       this.generating = false;
+    },
+
+    // --- Phase 6: export / import / settings ---
+
+    /** Loads the persisted "data directory location" setting into `dataDir`. Called once at
+     * startup (App.vue's onMounted) alongside initModelName/restoreSession. */
+    async loadDataDirSetting(): Promise<void> {
+      try {
+        const settings = await invoke<{ dataDir: string | null }>("load_settings");
+        this.dataDir = settings.dataDir ?? null;
+      } catch (err) {
+        console.warn("[chat store] could not load settings.json:", err);
+      }
+    },
+
+    /** Persists a new "data directory location". Passing `null` reverts to the local app-data
+     * default. Takes effect immediately for the next auto-save/default-path lookup -- the Rust
+     * side (`persistence::default_conversation_path`) reads settings.json fresh every call, it
+     * does not cache the value from startup. */
+    async setDataDir(dir: string | null): Promise<void> {
+      try {
+        await invoke("save_settings", { settings: { dataDir: dir } });
+        this.dataDir = dir;
+      } catch (err) {
+        this.fileError = `Could not save data directory setting: ${String(err)}`;
+      }
+    },
+
+    /** File > Export Memory. Opens a folder picker for the destination, then runs the backend
+     * export command, which emits `export-progress` events (listened to in App.vue) while it
+     * copies the quantized model, vocab, voice model, and all conversations into
+     * `<destination>/xenon2-backup/`. See EXPORT_FORMAT.md for the bundle layout. */
+    async exportMemory(): Promise<void> {
+      this.memoryError = null;
+      this.memoryMessage = null;
+      try {
+        const dest = await invoke<string | null>("pick_folder_dialog", {
+          testEnvVar: "XENON2_TEST_EXPORT_DEST_PATH",
+        });
+        if (!dest) return; // user cancelled
+        this.memoryOp = { kind: "export", file: "", fileIndex: 0, totalFiles: 0, bytesDone: 0, bytesTotal: 0 };
+        await invoke("export_memory", { destination: dest });
+      } catch (err) {
+        this.memoryError = `Export failed: ${String(err)}`;
+        this.memoryOp = null;
+      }
+    },
+
+    /** File > Import Memory. Opens a folder picker for the source bundle (or a folder containing
+     * an `xenon2-backup/` bundle), then runs the backend import command, which copies files
+     * in (does not run directly against the external path -- see EXPORT_FORMAT.md) and rewrites
+     * `session.json` to point at this machine's conversations directory. Reloads the session
+     * afterwards so the imported conversations show up in the sidebar immediately. */
+    async importMemory(): Promise<void> {
+      this.memoryError = null;
+      this.memoryMessage = null;
+      try {
+        const source = await invoke<string | null>("pick_folder_dialog", {
+          testEnvVar: "XENON2_TEST_IMPORT_SOURCE_PATH",
+        });
+        if (!source) return; // user cancelled
+        this.memoryOp = { kind: "import", file: "", fileIndex: 0, totalFiles: 0, bytesDone: 0, bytesTotal: 0 };
+        await invoke("import_memory", { source });
+        await this.restoreSession();
+      } catch (err) {
+        this.memoryError = `Import failed: ${String(err)}`;
+        this.memoryOp = null;
+      }
+    },
+
+    /** Handler for the `export-progress`/`import-progress` Tauri events (wired in App.vue). */
+    onMemoryProgress(
+      kind: "export" | "import",
+      payload: { file: string; fileIndex: number; totalFiles: number; bytesDone: number; bytesTotal: number }
+    ): void {
+      this.memoryOp = { kind, ...payload };
+    },
+
+    /** Handler for the `export-done`/`import-done` Tauri events. */
+    onMemoryDone(kind: "export" | "import", payload: { filesCopied: number; totalBytes: number }): void {
+      this.memoryOp = null;
+      const mb = (payload.totalBytes / (1024 * 1024)).toFixed(1);
+      this.memoryMessage = `${kind === "export" ? "Export" : "Import"} complete: ${payload.filesCopied} file(s), ${mb} MB.`;
+    },
+
+    /** Handler for the `export-error`/`import-error` Tauri events. */
+    onMemoryError(kind: "export" | "import", message: string): void {
+      this.memoryOp = null;
+      this.memoryError = `${kind === "export" ? "Export" : "Import"} failed: ${message}`;
     },
   },
 });

@@ -92,7 +92,11 @@ fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
 /// user-visible location silently, but also never block a normal send on a save dialog.
 #[tauri::command]
 pub fn default_conversation_path(app: AppHandle, conversation_id: String) -> Result<String, String> {
-    let dir = app_data_dir(&app)?.join("conversations");
+    // Phase 6: honor the "data directory location" setting if one is configured -- this is what
+    // makes an external drive usable as ongoing primary storage, not just a one-time export
+    // destination. Falls back to the pre-Phase-6 app-data default when unset (see
+    // `crate::memory::effective_conversations_dir`).
+    let dir = PathBuf::from(crate::memory::effective_conversations_dir(app)?);
     fs::create_dir_all(&dir)
         .map_err(|e| format!("Could not create '{}': {}", dir.display(), e))?;
     let path = dir.join(format!("{conversation_id}.json"));

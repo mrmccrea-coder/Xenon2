@@ -47,7 +47,9 @@ confirm nothing silently does real work.
 | **Delete icon on user messages** (`ChatMessage.vue`) | **Stub — unowned** | `console.log` only, exactly as Phase 3 left it. Explicitly out of scope for Phase 4 *and* Phase 5 — this is a real gap in `PLAN.md`'s task list, not an oversight. No phase currently owns implementing real delete. |
 | Mic toggle button (`MessageInput.vue`) | **Stub** | Visually toggles on/off (turns red), but captures no audio. Phase 2's STT pipeline (already built standalone under `../voice-pipeline/`) gets wired into this button in a later integration step, not in this phase. |
 | **File > Open / Save / Save As** | **Functional (Phase 5)** | Real native file dialogs (via `rfd`, called directly), real JSON read/write on disk, real schema validation with clear errors on malformed files. See "Phase 5: file persistence" below. |
-| File > Export Memory | **Stub** | Present, `console.log` only. Real copy-to-external-drive logic is **Phase 6**'s job. |
+| **File > Export Memory** | **Functional (Phase 6)** | Real folder picker + real copy of the quantized model, vocab, voice model, and all conversations into a portable bundle, with live byte-progress. See "Phase 6: external memory export/import" below. |
+| **File > Import Memory** | **Functional (Phase 6)** | Real folder picker + real copy-in of a previously-exported bundle into this machine's local paths, with live byte-progress. |
+| **File > Data Directory Settings** | **Functional (Phase 6)** | Persists an optional external "data directory location" (`settings.json`) that ongoing conversation saves/loads honor instead of the local app-data default. |
 
 ## State management: the Pinia store (`src/stores/chat.ts`)
 
@@ -215,6 +217,120 @@ in isolation:
   previously-saved 4-message conversation file; confirmed it replaced the active conversation
   (correct id, correct message count, correct `model` field) and appeared in the sidebar alongside
   the still-present empty chat, not duplicated.
+
+## Phase 6: external memory export/import
+
+Full bundle-layout documentation lives in `../EXPORT_FORMAT.md` at the repo root (the Phase 6
+counterpart to `SCHEMA.md`) — this section covers the implementation and what was actually tested.
+
+### Rust side (`app/src-tauri/src/memory.rs`)
+
+New module, registered as `#[tauri::command]`s in `lib.rs` alongside `persistence.rs`'s:
+- `export_memory(destination)` — copies the quantized model (`models/rwkv-5-world-0.4B-Q4_0.bin`),
+  tokenizer vocab (`inference-engine/data/world_vocab.bin`), piper voice model + its `.onnx.json`
+  sidecar (`voice-pipeline/models/`), and every `*.json` in the effective conversations directory
+  (plus `session.json`) into `<destination>/xenon2-backup/`, per `EXPORT_FORMAT.md`'s layout.
+  Deliberately excludes the `.pth`/FP16 conversion intermediates (~1.8GB, not loaded at runtime).
+- `import_memory(source)` — copy-in only (never runs directly against the external path) — see
+  `EXPORT_FORMAT.md`'s "Import: copy-in vs. run-in-place" for why. Copies a bundle's `models/`,
+  `voice-models/`, and `conversations/*.json` into this machine's real local paths (`models/`,
+  `voice-pipeline/models/`, and the effective conversations directory), then rewrites
+  `session.json`'s `conversationPaths` to point at this machine's conversations directory (the
+  source machine's original paths are meaningless here) before writing it to the local app-data
+  dir.
+- `copy_with_progress` — streams each file copy in 1MB chunks, emitting `export-progress` /
+  `import-progress` Tauri events (`{file, fileIndex, totalFiles, bytesDone, bytesTotal}`) after
+  every chunk, so the ~450MB model file shows real byte progress instead of appearing to hang.
+  `export-done`/`import-done`/`export-error`/`import-error` events signal completion, mirroring
+  `inference.rs`'s `generation-done`/`generation-error` pattern.
+- `pick_folder_dialog` — same `rfd` + 30s-timeout pattern as `persistence.rs`'s
+  `pick_save_dialog`/`pick_open_dialog` (see that file's doc comments for why: the OS Common Item
+  Dialog can hang on this dev machine, confirmed independent of Tauri/rfd).
+- `load_settings`/`save_settings` — read/write `<app-data-dir>/settings.json` (the "data directory
+  location" setting), deliberately a separate file from `session.json`.
+- `effective_conversations_dir` — resolves to `<dataDir>/conversations` if the setting is
+  configured, else `<app-data-dir>/conversations` (the pre-Phase-6 default). `persistence.rs`'s
+  `default_conversation_path` now calls this instead of hardcoding the app-data path, which is what
+  makes the setting actually affect ongoing auto-save/save/load, not just one-time export/import.
+
+### Frontend side
+
+- `MenuBar.vue` gained real "Export Memory...", "Import Memory...", and "Data Directory
+  Settings..." items (the old `console.log` stub is gone).
+- `stores/chat.ts` gained `exportMemory`/`importMemory` (pick a folder, invoke the backend command,
+  track progress via `memoryOp`) and `loadDataDirSetting`/`setDataDir`, plus
+  `onMemoryProgress`/`onMemoryDone`/`onMemoryError` handlers for the four new Tauri events.
+- `App.vue` renders a progress modal bound to `store.memoryOp` (file name, X/N counter, a real byte
+  progress bar, MB done/total) while an export or import is running, a dismissable toast on
+  success/failure, and a small dialog for the data directory setting (folder picker + Save/Use
+  Default/Cancel).
+
+### What was actually tested
+
+Verified against the real running dev build (`npm run tauri dev`, launched with
+`WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9333`), driving the real Tauri
+commands via `window.__TAURI_INTERNALS__.invoke(...)` over the Chrome DevTools Protocol — the same
+approach Phase 5 used for the checks that needed to bypass the OS file dialog. Not simulated, not
+unit-tested in isolation:
+
+1. **Export against a real destination folder**: ran `export_memory` with `destination` set to a
+   fresh folder under the Windows temp dir (`%TEMP%\xenon2-export-test`, outside the repo).
+   Inspected the result directly — `xenon2-backup\` contained `models\rwkv-5-world-0.4B-Q4_0.bin`
+   (453,875,493 bytes), `models\world_vocab.bin` (766,536 bytes),
+   `voice-models\en_US-lessac-medium.onnx` (63,201,294 bytes) + its `.onnx.json` sidecar (4,885
+   bytes), and `conversations\` with one real saved conversation `.json` (620 bytes) plus
+   `session.json` (317 bytes).
+   - **Total observed bundle size: 517,849,145 bytes (~494 MB / 494 MiB)** — matches the expected
+     ~450MB (model) + ~63MB (voice model) + small JSON, not gigabytes. Confirms the `.pth`
+     (923,523,954 bytes) and FP16 (924,161,829 bytes) intermediates — ~1.76GB together — were
+     correctly excluded.
+2. **Import round-trip, simulating a different machine**: copied the exported `xenon2-backup\`
+   folder to a second, independent fresh temp folder (`%TEMP%\xenon2-import-test-source`), then
+   pointed the "data directory location" setting at a third brand-new empty temp folder
+   (`%TEMP%\xenon2-fake-new-machine-data`, confirmed empty beforehand) to simulate a fresh
+   machine's conversation storage having no prior Xenon2 data — real models/voice files can't be
+   relocated to a literally different physical machine in this environment, so this is the honest
+   boundary of what "different machine" means here: a location with zero pre-existing data,
+   reached through the real settings mechanism, not a second physical computer. Ran `import_memory`
+   with that copied bundle as `source`. Confirmed:
+     - The conversation `.json` (byte-identical content) appeared in the fake new-machine
+       conversations folder.
+     - `settings.json`'s `dataDir` correctly redirected `effective_conversations_dir` there
+       beforehand (`invoke("effective_conversations_dir")` returned the fake folder's path).
+     - `session.json` (always written to the real app-data dir, by design — see
+       `EXPORT_FORMAT.md`) had its `conversationPaths` rewritten to point at the fake new-machine
+       folder, and `load_session_file` read it back correctly.
+     - `models\rwkv-5-world-0.4B-Q4_0.bin` and `inference-engine\data\world_vocab.bin` in the real
+       repo were overwritten by the import; `md5sum` of the bundle's copy and the repo's
+       post-import copy **matched exactly** (`8881a447b56c4dcef2c350c93695e664`), confirming a real,
+       correct byte-for-byte copy, not a no-op or a corrupted write.
+     - `voice-pipeline\models\en_US-lessac-medium.onnx` (+ sidecar) were similarly overwritten with
+       fresh mtimes.
+     - After reverting the data directory setting back to `null`, `open_conversation_file` against
+       the original real conversation path still returned the correct, unmodified content
+       (`"Hello Xenon, this is a Phase 5 persistence test message."` / one user + one assistant
+       message) — confirming the import test did not corrupt or lose the pre-existing real
+       conversation history on this machine.
+3. **Data directory setting takes effect for subsequent saves/loads**: directly invoked
+   `save_settings` to set `dataDir`, then `effective_conversations_dir` and confirmed it resolved
+   to the new location; `default_conversation_path` (used by auto-save) calls the same function, so
+   this is the exact code path a real new conversation's first auto-save goes through. Reverted the
+   setting afterward and confirmed `effective_conversations_dir` fell back to the local app-data
+   default again.
+4. **Rust compiles cleanly**: `cargo build` in `app/src-tauri` succeeds with the new `memory.rs`
+   module and `lib.rs`/`persistence.rs` changes (two borrow-checker errors caught and fixed during
+   development — cloning `PathBuf`s before moving them into `spawn_blocking` closures).
+5. **Frontend typechecks cleanly**: `npx vue-tsc --noEmit` passes with no errors across
+   `MenuBar.vue`, `App.vue`, and `stores/chat.ts`'s Phase 6 additions.
+
+**Not verified in this pass**: a full GUI click-through of the new menu items and progress modal
+(the OS folder-picker dialog itself has the same known hang risk documented in `persistence.rs` for
+the save/open dialogs, and driving it via UI Automation was out of scope for this pass) — the
+underlying commands those UI elements call were exercised directly and are the same commands the
+UI invokes, so this is a backend/IPC-level verification, not a pixel-level one. A full real-machine
+migration (copying a bundle to physical removable media and importing on a second physical computer)
+was also not performed — verified instead via the "fresh temp directory with zero prior data"
+substitution described above.
 
 ## How the Tauri IPC command connects to Phase 1
 

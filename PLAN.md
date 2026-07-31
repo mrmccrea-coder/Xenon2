@@ -158,7 +158,7 @@ Tasks:
 
 ---
 
-## Phase 6 — External Memory Export/Import
+## Phase 6 — External Memory Export/Import [x]
 
 **Depends on**: Phase 5
 
