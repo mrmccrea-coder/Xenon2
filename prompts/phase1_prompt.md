@@ -1,5 +1,19 @@
 # Prompt: Xenon2 Phase 1 — Inference Engine Core
 
+## Follow-up fix (read this first if Phase 1 was already built)
+
+Phase 1 was already completed once and verified working, but a real gap
+was found afterward: the CMake build does not copy
+`inference-engine/data/world_vocab.bin` (the RWKV tokenizer vocab file)
+into the compiled output directories (`build-cpu-app/bin/Release/` and
+`build-cuda-app/bin/Release/`). As a result, `test_inference.exe` only
+works if you `cd` to the project root and pass a relative path to the
+vocab file — running the .exe directly from its own build folder (as a
+truly portable, self-contained build should support) fails with
+`WorldTokenizer: failed to open vocab file`. See task 8 and the added
+acceptance criterion below for the fix — everything else in this prompt
+describes Phase 1's original scope for context.
+
 ## Background
 
 You're building **Xenon2**, a portable, offline-first desktop AI assistant
@@ -90,6 +104,16 @@ command line. No UI, no voice, no file save/load.
 7. Benchmark the same prompt/model both ways — CPU-only vs GPU-offloaded
    (all layers on GPU) — and record tokens/sec and time-to-first-token for
    each in the README.
+8. Fix the build so `inference-engine/data/world_vocab.bin` is copied
+   automatically into both `build-cpu-app/bin/Release/` and
+   `build-cuda-app/bin/Release/` (alongside `test_inference.exe` and the
+   other DLLs already copied there) as part of the normal CMake build —
+   e.g. a `file(COPY ...)` or `add_custom_command(TARGET ... POST_BUILD
+   ...)` step in `CMakeLists.txt`, not a manual copy step someone has to
+   remember to run. The tokenizer should look for the vocab file next to
+   the executable first (or via a path resolved relative to the
+   executable's own location), not only relative to the current working
+   directory or the project root.
 
 ### Acceptance criteria (verify before considering this phase done)
 
@@ -105,6 +129,12 @@ command line. No UI, no voice, no file save/load.
 - GPU-offloaded mode is confirmed faster (or at least not slower) than
   CPU-only for the same model/prompt; if GPU offload is somehow slower or
   unstable, document that clearly rather than silently defaulting to CPU.
+- Running `test_inference.exe` directly from inside its own build output
+  folder (e.g. `cd build-cpu-app\bin\Release` then
+  `.\test_inference.exe "hello, how are you?" --model <path-to-model>`,
+  with no reliance on being run from the project root) successfully finds
+  and loads `world_vocab.bin` without error. Verify this for both the
+  CPU-only and CUDA build folders, not just one.
 
 ### When finished
 
@@ -112,4 +142,6 @@ Update the Phase 1 heading in `C:\Users\New user\Xenon2\PLAN.md` to mark
 it complete, and note in a short `inference-engine/README.md` how to build
 it (both CPU-only and cuBLAS builds), which model file it expects, how to
 run the CLI test harness with and without GPU offload, and the CPU-vs-GPU
-benchmark results.
+benchmark results. If you're doing the follow-up vocab-file fix on an
+already-completed Phase 1, update that same README section to note the fix
+and confirm both build folders were re-verified as self-contained.

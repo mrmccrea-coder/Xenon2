@@ -1,3 +1,4 @@
 [submodule "inference-engine/rwkv.cpp"]
 	path = inference-engine/rwkv.cpp
 	url = https://github.com/RWKV/rwkv.cpp.git
+	ignore = untracked
