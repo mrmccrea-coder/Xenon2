@@ -66,6 +66,78 @@ xenon_generate(engine, prompt, max_tokens, temperature, top_p, my_callback, my_u
 xenon_free_engine(engine);
 ```
 
+## Persistent state across calls (Phase 8)
+
+Through Phase 7, `xenon_generate()` reset the engine's RWKV state on every call, so a caller
+doing multi-turn conversation had to re-serialize and re-evaluate the *entire* conversation as
+text every turn -- paying transformer-shaped prefill costs on an architecture (RWKV) whose whole
+point is a fixed-size recurrent state that makes that unnecessary. Measured before this phase:
+153 tokens of fixed preamble re-fed every turn, growing to 450+ tokens of history by turn 10.
+
+`xenon_state` is a new opaque, caller-owned handle for exactly this: it lets a caller keep a
+conversation's state alive across calls and feed only the *new* text each turn.
+
+```c
+xenon_state * s = xenon_state_new(engine);
+xenon_state_reset(engine, s);
+xenon_prefill(engine, s, "<static preamble text, never changes>");   // one-time cost
+// ... once per turn, generate from a throwaway copy so `s` never absorbs unconfirmed output:
+xenon_state * scratch = xenon_state_new(engine);
+xenon_state_copy(scratch, s);
+xenon_generate_with_state(engine, scratch, "User: hi\n\nXenon:", ..., my_callback, my_user_data);
+xenon_state_free(scratch);
+// once the caller knows the canonical (possibly trimmed) text for this turn, commit it to `s`:
+xenon_prefill(engine, s, "User: hi\n\nXenon: <trimmed reply>\n\n");
+```
+
+`xenon_generate()` itself is unchanged in signature and behavior -- it's now a thin wrapper
+(`xenon_state_new` + `xenon_state_reset` + `xenon_generate_with_state` + `xenon_state_free`) kept
+for the two callers that bind this exact signature (`voice-pipeline/xenon_engine.py`'s ctypes
+bindings, `test_inference.cpp`). New code (the Tauri app) uses the incremental API directly --
+see `app/src-tauri/src/inference.rs`'s `ensure_cache_extended` for the caching/invalidation policy
+actually used there: an LRU of per-conversation states, diffed against each incoming request's
+history to decide "extend" (prefill just the new tail turns) vs. "rebuild" (an edit or delete
+happened; start over from a shared, engine-level static-prefix state).
+
+One subtlety worth calling out here because it's easy to get wrong: **the authoritative state for
+a conversation should only ever be advanced via `xenon_prefill` of text the caller already
+considers canonical, never by keeping whatever a generation call happened to leave behind.**
+Generation should run on a throwaway `xenon_state_copy`, and the real state gets the confirmed
+text later. This app's own caller trims/post-processes model output (strips a trailing stop
+sequence, a canned-phrase backstop) *after* generation completes, so the state at the moment
+generation finishes is not the state the caller will treat as canonical -- committing raw
+generation output directly would silently drift the two apart.
+
+Repeat-penalty continuity: `xenon_generate()`'s per-call `recent_tokens` window (tail-256 of the
+prompt, used by the repetition penalty) is now `xenon_state`'s persistent `recent_tokens` field,
+appended to by every token consumed via `xenon_prefill` or `xenon_generate_with_state` and capped
+at 256 from the front -- mathematically the same tail-256 window a full re-feed would compute.
+`inference-engine/src/test_state_cache.cpp` proves this equivalence directly: it asserts
+byte-identical text *and* token-id sequences between a full reset-and-refeed and the incremental
+path, at turn 1, turn 5, after an edited earlier turn, and after a regenerate, all with
+`repeat_penalty` enabled (temperature 0 / greedy decoding makes this deterministic without
+needing to seed the RNG -- `sample_logits` short-circuits to argmax before touching it).
+
+**Measured (RWKV-7 World 2.9B, this machine):**
+
+| | `xenon_get_state_len()` |
+|---|---|
+| RWKV-5 World 0.4B (Phase 1) | 1,622,016 floats (6.19 MB) |
+| RWKV-7 World 2.9B (current) | 5,406,720 floats (20.62 MB) |
+
+| turn | old (full re-feed): tokens evaluated | new (incremental): tokens evaluated |
+|---|---|---|
+| 1  | 167 | 55 (+112 one-time static-prefix cost, shared across all conversations) |
+| 5  | 280 | 83 (28 extend + 55 suffix) |
+| 10 | 420 | 83 (28 extend + 55 suffix) |
+
+The old path grows without bound as a conversation gets longer; the new path is flat. Wall time
+for a 20-token reply at turn 10 dropped from 16.97s to 4.65s on this machine (both CPU-only,
+un-cached weights already resident) -- run `test_state_cache.exe --benchmark` yourself to
+reproduce (`--correctness` runs the byte-identical proof above). Steady-state per-token
+generation throughput is unaffected (the generation loop itself is untouched, just operating on
+`xenon_state` fields instead of fields that used to live directly on `xenon_engine`).
+
 ## Building
 
 `rwkv.cpp`'s C library and this project's wrapper/CLI are built as **two separate stages**, so
@@ -236,10 +308,12 @@ benchmark/memory runs).
 ### Repetition penalty (Phase 7 follow-up, 2026-08-02)
 
 `xenon_generate` originally had no repetition penalty at all -- just temperature + top-p. Real
-usage of the desktop app showed a real failure mode this caused: since the app resends the full
-conversation history as text on every call (no incremental RWKV state across calls), once the
-model produced a canned phrase once, that phrase became part of every later prompt and the model
-started imitating it for unrelated questions instead of answering them. Added a standard
+usage of the desktop app showed a real failure mode this caused: since the app resent the full
+conversation history as text on every call (no incremental RWKV state across calls -- Phase 8
+later added that, see "Persistent state across calls" above, and carried the same repeat-penalty
+window forward as `xenon_state`'s persistent `recent_tokens` field), once the model produced a
+canned phrase once, that phrase became part of every later prompt and the model started imitating
+it for unrelated questions instead of answering them. Added a standard
 llama.cpp-style penalty (`sample_logits` in `xenon_inference.cpp`) applied to any token seen in the
 last 256 tokens of the prompt tail *plus* everything generated so far this call -- deliberately
 covering the prompt tail, not just this call's own output, since the failure mode was echoing

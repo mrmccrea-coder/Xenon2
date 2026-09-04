@@ -282,6 +282,32 @@ model file since the Phase 7 model upgrade. Fixed.
 
 ---
 
+## Phase 8 — Persistent RWKV state [x]
+
+Performance phase, not new user-facing scope, closing a gap a performance
+audit found: `xenon_generate()` reset RWKV state on every call, so every turn
+re-serialized and re-evaluated the entire conversation as text -- a cost that
+grew without bound the longer a conversation went on, defeating the whole
+point of an architecture (RWKV) chosen specifically for its fixed-size
+recurrent state.
+
+Added a caller-owned `xenon_state` type to `inference-engine` (`xenon_prefill`
+/ `xenon_generate_with_state`, `xenon_generate()` itself unchanged in
+signature/behavior) and an LRU of per-conversation cached state in
+`app/src-tauri/src/inference.rs`, diffed against each incoming request's
+history to decide "extend" (prefill just the new tail turns) vs. "rebuild"
+(an edit or delete happened). Reordered the prompt so the truly-static
+few-shot block and the growing history both come before the one part that
+has to be re-fed every turn regardless (the real-clock/facts header) --
+without that reorder, caching the history was impossible at all (RWKV state
+is strictly sequential, so a changing value at the front invalidates
+everything cached after it). See `app/README.md`'s "Phase 8" section and
+`inference-engine/README.md`'s "Persistent state across calls" section for
+the full design, the correctness proof (`test_state_cache.cpp`, byte-identical
+output at turn 1/5/edit/regenerate), and measured before/after numbers.
+
+---
+
 ## Future work (not yet scheduled)
 
 - Mamba backend as an alternative to RWKV, once `mamba.cpp` tooling matures.

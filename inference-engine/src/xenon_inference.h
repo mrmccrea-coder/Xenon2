@@ -29,8 +29,18 @@
 extern "C" {
 #endif
 
-// Opaque handle to a loaded model + tokenizer + RWKV state, ready for generation.
+// Opaque handle to a loaded model + tokenizer, ready for generation. Does NOT itself hold
+// conversation state any more (Phase 8) -- state now lives in caller-owned `xenon_state` objects
+// below, so a caller can keep multiple independent conversations alive against one loaded model.
 typedef struct xenon_engine xenon_engine;
+
+// Opaque, caller-owned RWKV state (recurrent state + logits from the last token evaluated into
+// it, plus internal bookkeeping for the repeat-penalty window -- see xenon_prefill). Sized from
+// xenon_get_state_len()/xenon_get_logits_len() internally; the caller never touches its layout,
+// only passes the pointer around. One xenon_state can represent "this conversation so far",
+// letting a caller feed only the *new* text on each turn (xenon_prefill / xenon_generate_with_state)
+// instead of re-processing the whole conversation every time -- see those functions' docs.
+typedef struct xenon_state xenon_state;
 
 typedef enum xenon_status {
     XENON_OK = 0,
@@ -71,9 +81,81 @@ XENON_API xenon_engine * xenon_load_model(
 XENON_API void xenon_free_engine(xenon_engine * engine);
 
 // Resets the engine's RWKV state (equivalent to starting a brand new conversation with no
-// prior context). Called automatically at the start of xenon_generate; exposed separately in
-// case a future caller wants to manage state across multiple generate() calls itself.
+// prior context). Kept for backwards compatibility; equivalent to xenon_reset_state_v2(engine,
+// state) on whatever scratch state xenon_generate() itself uses internally. Exposed separately
+// in case a caller wants to manage state across multiple generate() calls itself.
 XENON_API void xenon_reset_state(xenon_engine * engine);
+
+// --- Phase 8: caller-owned incremental state ------------------------------------------------
+//
+// A `xenon_state` lets a caller keep a conversation's RWKV state alive across calls instead of
+// re-processing the whole conversation as text every turn (which is what plain xenon_generate()
+// below still does, for backwards compatibility -- it allocates a scratch xenon_state, resets
+// it, and is otherwise implemented in terms of these functions). Typical incremental usage:
+//
+//   xenon_state * s = xenon_state_new(engine);
+//   xenon_state_reset(engine, s);
+//   xenon_prefill(engine, s, "<static preamble text, never changes>");
+//   // ... later, once per turn:
+//   xenon_state * scratch = xenon_state_new(engine);
+//   xenon_state_copy(scratch, s);              // don't generate directly into the authoritative state
+//   xenon_generate_with_state(engine, scratch, "User: hi\n\nXenon:", ..., callback, user_data);
+//   xenon_state_free(scratch);
+//   // once the caller knows the canonical (possibly trimmed) text for this turn, commit it:
+//   xenon_prefill(engine, s, "User: hi\n\nXenon: <trimmed reply>\n\n");
+//
+// This split (generate into a scratch copy, only ever advance the authoritative state via
+// xenon_prefill of caller-confirmed text) is deliberate: it means the authoritative state can
+// never drift from whatever text the caller considers canonical, even if the caller trims or
+// otherwise post-processes what a model actually generated before treating it as final.
+
+// Allocates a new state sized for `engine` (from xenon_get_state_len()/xenon_get_logits_len()).
+// The state is uninitialized (garbage) until xenon_state_reset() or a copy is applied to it.
+// Returns NULL on allocation failure or a NULL engine.
+XENON_API xenon_state * xenon_state_new(xenon_engine * engine);
+
+// Frees a state allocated by xenon_state_new(). Safe to call with NULL.
+XENON_API void xenon_state_free(xenon_state * state);
+
+// Copies all of `src`'s contents (RWKV state, cached logits, repeat-penalty token window) into
+// `dst`. Both must have been allocated for the same engine. This is how callers take a cheap
+// snapshot to generate from without mutating the authoritative copy (see usage above).
+XENON_API void xenon_state_copy(xenon_state * dst, const xenon_state * src);
+
+// Resets `state` to a fresh/empty conversation (equivalent to what xenon_reset_state() does for
+// xenon_generate()'s own internal scratch state): RWKV state zeroed via rwkv_init_state, cached
+// logits cleared, repeat-penalty token window cleared.
+XENON_API void xenon_state_reset(xenon_engine * engine, xenon_state * state);
+
+// Evaluates `text` into `state` WITHOUT generating anything -- pure prefill. Advances `state`'s
+// RWKV state, cached logits (from the last token of `text`), and repeat-penalty token window in
+// place, exactly as if `text` had been the tail of a prompt fed to xenon_generate() from a fresh
+// state. `text` == "" is a no-op (returns XENON_OK immediately, state untouched) -- convenient
+// for callers with an optional block (e.g. "no extra facts this turn") that may be empty.
+XENON_API xenon_status xenon_prefill(
+    xenon_engine * engine,
+    xenon_state * state,
+    const char * text
+);
+
+// Same contract as xenon_generate() below, except it starts from (and advances in place) a
+// caller-supplied `state` instead of an internal scratch one, and `prompt` is just the NEW text
+// to evaluate before generating (e.g. the newest turn), not the whole conversation -- whatever
+// was already fed into `state` (via xenon_prefill or a previous xenon_generate_with_state call)
+// is not re-evaluated. Like xenon_generate(), `prompt` encoding to zero tokens is an error
+// (XENON_ERROR_ARGS) -- use xenon_prefill first (which tolerates "") if there's nothing new to
+// feed before generating.
+XENON_API xenon_status xenon_generate_with_state(
+    xenon_engine * engine,
+    xenon_state * state,
+    const char * prompt,
+    int max_tokens,
+    float temperature,
+    float top_p,
+    float repeat_penalty,
+    xenon_token_callback callback,
+    void * user_data
+);
 
 // Streams a generated continuation of `prompt`, invoking `callback` once per generated token
 // as it is produced (not batched). Stops after `max_tokens` tokens, when the callback returns
@@ -87,6 +169,11 @@ XENON_API void xenon_reset_state(xenon_engine * engine);
 //   sitting in the conversation history from an earlier turn -- with no penalty at all, once a
 //   phrase like "I'm sorry, I can't access my memories" entered the resent history, the model
 //   would keep reproducing it for unrelated follow-up questions.
+// Resets RWKV state at the start of the call (this function has no memory of previous calls --
+// as of Phase 8 it is implemented as a thin wrapper: allocate a scratch xenon_state, reset it,
+// call xenon_generate_with_state, free it. Kept for the two callers that bind this exact
+// signature -- voice-pipeline/xenon_engine.py's ctypes bindings and test_inference.cpp -- see
+// xenon_generate_with_state above for the incremental-state version this app actually uses now).
 // Returns XENON_OK on success (including early stop via callback), otherwise an error code.
 XENON_API xenon_status xenon_generate(
     xenon_engine * engine,

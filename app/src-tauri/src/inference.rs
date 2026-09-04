@@ -19,7 +19,7 @@ use crate::sloth_memory;
 /// One turn of conversation, as sent from the Vue frontend. Mirrors the shape of a chat message
 /// but deliberately doesn't carry UI-only fields (ids, timestamps, streaming flags, etc) -- this
 /// is a minimal payload just for prompt construction.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct ChatTurn {
     pub role: String, // "user" | "assistant"
     pub content: String,
@@ -45,18 +45,70 @@ struct GenerationErrorEvent {
     message: String,
 }
 
-/// Raw engine pointer, guarded by a mutex so only one generation runs at a time (rwkv.cpp's
-/// per-engine state is not designed for concurrent calls). `xenon_engine*` is safe to hand off
-/// across threads as long as access is serialized, which the Mutex guarantees.
+/// Raw engine pointer. `xenon_engine*` is safe to hand off across threads as long as access is
+/// serialized, which the Mutex around `EngineInner` guarantees.
 pub(crate) struct EnginePtr(*mut ffi::XenonEngine);
 unsafe impl Send for EnginePtr {}
+
+/// Raw incremental-state pointer (Phase 8, see `xenon_inference.h`'s `xenon_state` docs). Frees
+/// itself via `xenon_state_free` on drop so every place that allocates one (a cache entry, a
+/// per-turn scratch copy) can just let it go out of scope instead of remembering to free it.
+pub(crate) struct XenonStatePtr(*mut ffi::XenonState);
+unsafe impl Send for XenonStatePtr {}
+
+impl Drop for XenonStatePtr {
+    fn drop(&mut self) {
+        unsafe { ffi::xenon_state_free(self.0) };
+    }
+}
+
+/// One conversation's cached incremental state, plus the exact turns it has already consumed --
+/// used to diff against an incoming `history` array and decide "extend" vs. "rebuild" (see
+/// `ensure_cache_extended`). `consumed` never includes the newest, not-yet-answered user turn,
+/// and is only ever advanced from caller-confirmed history text, never from this turn's own
+/// generation output -- see `generate_blocking`'s doc comment for why that matters.
+struct CachedConversation {
+    consumed: Vec<ChatTurn>,
+    state: XenonStatePtr,
+}
+
+/// Bound on how many conversations' incremental state is kept alive at once. Each entry is one
+/// `xenon_get_state_len()`-sized buffer (measured at ~20.6 MB for the RWKV-7 2.9B model -- see
+/// `inference-engine/README.md`), so this caps the feature's steady-state memory cost at
+/// roughly 4 x that, plus the two engine-level static states -- trivial next to the multi-GB
+/// model weights already resident. Least-recently-used entries are evicted first (see
+/// `ensure_cache_extended`).
+const MAX_CACHED_CONVERSATIONS: usize = 4;
+
+/// Everything needed to run generation, guarded by one mutex so only one generation (or cache
+/// mutation) runs at a time -- rwkv.cpp's per-engine state is not designed for concurrent calls,
+/// and Phase 8's incremental states are per-conversation data guarded alongside it, not a
+/// separate lock (see this struct's fields).
+pub(crate) struct EngineInner {
+    engine: EnginePtr,
+    /// The conversation preamble (instruction + demo turns) -- byte-identical on every call ever
+    /// made, so it's prefilled once here instead of every turn. See `inference.rs`'s
+    /// `STATIC_PREFIX` and `build_prompt`'s Phase 8 doc comment for why this text can be first
+    /// and still cacheable (unlike the volatile header, which can't).
+    static_prefix: XenonStatePtr,
+    /// The Sloth fact-extraction few-shot preamble, prefilled once the same way. Entirely
+    /// separate from `conversation_cache` below and never touched by conversation generation --
+    /// extraction must never be able to corrupt a conversation's cached state (see
+    /// `run_fact_extraction`).
+    extraction_prefix: XenonStatePtr,
+    /// LRU cache of per-conversation incremental state, keyed by conversation id. A `Vec` (not a
+    /// `HashMap`) because eviction order is exactly insertion/access order and there are at most
+    /// `MAX_CACHED_CONVERSATIONS` entries -- a linear scan over a handful of entries is simpler
+    /// and just as fast as a HashMap + separate LRU list here.
+    conversation_cache: Vec<(String, CachedConversation)>,
+}
 
 /// `Arc` (not a bare `Mutex`) because the IPC command below needs to clone a handle to it into a
 /// `spawn_blocking` closure and hold the lock for the *entire* generate() call, not just long
 /// enough to read the pointer out -- rwkv.cpp's per-engine state isn't safe for concurrent eval
 /// calls, so the lock must stay held across the whole blocking generation, not be dropped early.
 #[derive(Clone)]
-pub struct EngineState(pub Arc<Mutex<EnginePtr>>);
+pub struct EngineState(pub Arc<Mutex<EngineInner>>);
 
 /// The loaded model's name/version (its filename, minus extension, e.g.
 /// `"rwkv-5-world-0.4B-Q4_0"`), recorded so Phase 5's saved conversation files can note which
@@ -115,8 +167,42 @@ pub fn load_engine(repo_root: &PathBuf) -> (EngineState, ModelInfo) {
         );
     }
 
+    // Phase 8: prefill the two engine-level static preambles once, up front, instead of
+    // re-evaluating them on every single generate/extraction call -- see `EngineInner`'s doc
+    // comment and `STATIC_PREFIX` / `build_extraction_prompt`'s static half below. A failure
+    // here means the tokenizer/engine can't even process plain text, which would fail every real
+    // generation anyway, so panicking (matching this function's existing "fail app startup
+    // loudly" policy) rather than falling back to an unprimed state is intentional.
+    let static_prefix = unsafe {
+        let state = ffi::xenon_state_new(engine);
+        ffi::xenon_state_reset(engine, state);
+        let text = CString::new(STATIC_PREFIX).expect("STATIC_PREFIX contains no NUL bytes");
+        let status = ffi::xenon_prefill(engine, state, text.as_ptr());
+        if status != ffi::XenonStatus::OK {
+            panic!("Failed to prefill Phase 8 static prefix: {}", last_error());
+        }
+        XenonStatePtr(state)
+    };
+
+    let extraction_prefix = unsafe {
+        let state = ffi::xenon_state_new(engine);
+        ffi::xenon_state_reset(engine, state);
+        let text = CString::new(EXTRACTION_STATIC_PREFIX)
+            .expect("EXTRACTION_STATIC_PREFIX contains no NUL bytes");
+        let status = ffi::xenon_prefill(engine, state, text.as_ptr());
+        if status != ffi::XenonStatus::OK {
+            panic!("Failed to prefill Phase 8 extraction prefix: {}", last_error());
+        }
+        XenonStatePtr(state)
+    };
+
     (
-        EngineState(Arc::new(Mutex::new(EnginePtr(engine)))),
+        EngineState(Arc::new(Mutex::new(EngineInner {
+            engine: EnginePtr(engine),
+            static_prefix,
+            extraction_prefix,
+            conversation_cache: Vec::new(),
+        }))),
         ModelInfo(model_name),
     )
 }
@@ -132,62 +218,86 @@ fn last_error() -> String {
     }
 }
 
-/// Builds the same "User: ... / Xenon: ..." chat-style prime used by Phase 1's CLI harness
-/// (`test_inference.cpp`'s `build_chat_prompt`), extended to include the full turn history so a
-/// small base-ish World model stays on-topic across a multi-turn conversation. `xenon_generate`
-/// resets the model's RWKV state at the start of every call (see xenon_inference.h), so the
-/// entire conversation-so-far has to be re-fed as text each time -- there is no cross-call
-/// incremental state to build on yet.
-fn build_prompt(history: &[ChatTurn], facts: &[sloth_memory::SlothFact]) -> String {
-    let mut prompt = String::new();
+// Phase 8 follow-up: this used to be one `build_prompt()` function producing one string in the
+// order [volatile date/time header] -> [static few-shot] -> [history] -> "Xenon:". That ordering
+// made incremental state caching *impossible*: RWKV state is strictly sequential, so a value that
+// changes every call (the header) sitting at position 0 invalidates everything fed after it on
+// every single call, no matter how it's cached. Reordered to [static prefix] -> [history] ->
+// [volatile header] -> [new turn] -> "Xenon:" -- same wording, same facts injection, same time
+// example, just moved so the two truly-cacheable pieces (the static prefix, prefilled once ever
+// at engine load; the growing history, prefilled incrementally per conversation) both come before
+// the one piece that has to be re-fed every turn regardless (the header). See `EngineInner`'s doc
+// comment and `ensure_cache_extended` for how the three pieces below are actually assembled and
+// cached. Moving the header to sit immediately before the new turn is plausibly *better* for
+// grounding (closer to the generation point = more salient to an autoregressive model) rather
+// than worse, and was sanity-checked against the old ordering on real prompts (see Phase 8 commit
+// notes) rather than assumed safe.
 
-    // Phase 7 follow-up (2026-08-04): real usage showed the model confidently making up a
-    // specific time ("The time is 12:30 PM.") when asked, with no actual clock access at all --
-    // then falling back to a canned non-answer when asked how it knew that. Ground every prompt
-    // (both agents -- this is basic environmental grounding, not memory, so it's not gated behind
-    // Sloth) in the real system clock so time/date questions get a real answer instead of a
-    // plausible-sounding guess.
+/// Byte-identical on every single call this app will ever make -- prefilled once into
+/// `EngineInner::static_prefix` at `load_engine` time instead of being re-evaluated per turn.
+/// Phase 7 follow-up note preserved: the seed example used to end with "How can I help you
+/// today?" -- real usage showed the model imitating that closing-question *style* on nearly every
+/// reply regardless of content, because a small base model leans heavily on the literal style of
+/// whatever example it's shown, not just the instruction-like framing around it. These two
+/// example turns both end declaratively, no trailing question, to actually change the imitated
+/// style rather than just ask for it in prose (which this model has already shown it doesn't
+/// reliably follow -- see sloth_memory's extraction prompt fix for the same lesson).
+const STATIC_PREFIX: &str =
+    "The following is a coherent, friendly conversation between a user and Xenon, a \
+     helpful voice assistant. Xenon answers naturally and doesn't end every reply by asking \
+     what else it can help with.\n\n\
+     User: Hello Xenon, how are you doing?\n\n\
+     Xenon: Hi! I'm doing well, thanks for asking.\n\n\
+     User: What's a fun fact about space?\n\n\
+     Xenon: A day on Venus is longer than its year -- it rotates so slowly that one spin \
+     takes longer than one full trip around the sun.\n\n";
+
+/// Formats a slice of turns exactly as the old `build_prompt`'s history loop did: this is the
+/// piece that gets prefilled incrementally into a conversation's cached state (see
+/// `ensure_cache_extended`), so its exact text must stay stable across calls -- changing this
+/// function's output for turns already in a cache would silently desync the cache from what a
+/// fresh rebuild would produce.
+fn history_text(turns: &[ChatTurn]) -> String {
+    let mut out = String::new();
+    for turn in turns {
+        if turn.role == "user" {
+            out.push_str("User: ");
+        } else {
+            out.push_str("Xenon: ");
+        }
+        out.push_str(turn.content.trim());
+        out.push_str("\n\n");
+    }
+    out
+}
+
+/// The one part of the prompt that must be re-fed every single turn regardless of caching --
+/// see this section's Phase 8 doc comment above for why it can't sit at the front any more.
+/// Preserves both Phase 7 follow-up fixes verbatim, just relocated: real-clock grounding (the
+/// model was found to confidently make up a specific time with no actual clock access at all)
+/// and Sloth's persistent facts injection (skipped entirely for Dementia turns, which always
+/// pass an empty `facts` slice, so Dementia's volatile header is byte-for-byte what it always
+/// was pre-Phase-8, just at a different position in the overall prompt).
+fn volatile_header_text(facts: &[sloth_memory::SlothFact]) -> String {
+    let mut out = String::new();
+
     let now = chrono::Local::now();
     let now_full = now.format("%A, %B %d, %Y, %I:%M %p").to_string();
     let now_time_only = now.format("%I:%M %p").to_string();
-    prompt.push_str("The current date and time is ");
-    prompt.push_str(&now_full);
-    prompt.push_str(".\n\n");
+    out.push_str("The current date and time is ");
+    out.push_str(&now_full);
+    out.push_str(".\n\n");
 
-    // Phase 7 follow-up: Sloth's persistent cross-conversation memory. Dementia turns always
-    // call this with an empty `facts` slice, so this block is skipped entirely and Dementia's
-    // prompt is byte-for-byte what it always was -- Sloth is strictly additive, not a change to
-    // the default/no-memory behavior.
     if !facts.is_empty() {
-        prompt.push_str(
-            "Known facts about the user, remembered from past conversations:\n",
-        );
+        out.push_str("Known facts about the user, remembered from past conversations:\n");
         for fact in facts {
-            prompt.push_str("- ");
-            prompt.push_str(&fact.text);
-            prompt.push('\n');
+            out.push_str("- ");
+            out.push_str(&fact.text);
+            out.push('\n');
         }
-        prompt.push('\n');
+        out.push('\n');
     }
 
-    // Phase 7 follow-up (2026-08-02): the seed example used to end with "How can I help you
-    // today?" -- a real usage session showed the model imitating that closing-question *style*
-    // on nearly every reply regardless of content ("Is there anything else I can help you
-    // with?"), because a small base model leans heavily on the literal style of whatever example
-    // it's shown, not just the instruction-like framing around it. Replaced with two example
-    // turns that both end declaratively, no trailing question, to actually change the imitated
-    // style rather than just ask for it in prose (which this model has already shown it doesn't
-    // reliably follow -- see sloth_memory's extraction prompt fix for the same lesson).
-    prompt.push_str(
-        "The following is a coherent, friendly conversation between a user and Xenon, a \
-         helpful voice assistant. Xenon answers naturally and doesn't end every reply by asking \
-         what else it can help with.\n\n\
-         User: Hello Xenon, how are you doing?\n\n\
-         Xenon: Hi! I'm doing well, thanks for asking.\n\n\
-         User: What's a fun fact about space?\n\n\
-         Xenon: A day on Venus is longer than its year -- it rotates so slowly that one spin \
-         takes longer than one full trip around the sun.\n\n",
-    );
     // A dedicated example for time questions, using the *real* current time computed above (not
     // a fixed fake value) -- a plain instruction to "use the date/time given above" wasn't
     // reliably followed for short phrasings like "What time is it?" (it worked for a more
@@ -195,23 +305,12 @@ fn build_prompt(history: &[ChatTurn], facts: &[sloth_memory::SlothFact]) -> Stri
     // pattern instead. Using the real time here means the example is never factually wrong
     // regardless of when it's generated, so there's no risk of the model anchoring on a stale or
     // made-up value the way a fixed example would.
-    prompt.push_str(&format!(
+    out.push_str(&format!(
         "User: What time is it?\n\n\
          Xenon: It's currently {now_time_only}.\n\n"
     ));
 
-    for turn in history {
-        if turn.role == "user" {
-            prompt.push_str("User: ");
-        } else {
-            prompt.push_str("Xenon: ");
-        }
-        prompt.push_str(turn.content.trim());
-        prompt.push_str("\n\n");
-    }
-
-    prompt.push_str("Xenon:");
-    prompt
+    out
 }
 
 fn ends_with_stop(tail: &str) -> bool {
@@ -296,71 +395,78 @@ extern "C" fn on_extraction_token(
     buf.borrow().len() < 300 // safety cap, well beyond one short sentence
 }
 
-/// Builds the extraction prompt asking the model whether the just-completed exchange revealed
-/// anything new and durable worth remembering long-term. Kept deliberately strict ("reply with
-/// exactly: NONE") since this is a small, non-instruction-tuned base model -- without a strong
-/// steer it tends to invent something rather than correctly recognize "nothing new here".
-fn build_extraction_prompt(user_text: &str, reply_text: &str) -> String {
-    // Few-shot, not just an abstract instruction -- a bare "extract a fact or say NONE"
-    // instruction was found to make this small base model *invent* a plausible-sounding fact
-    // (e.g. "named John, loves pizza") even when the user never said any such thing, rather than
-    // correctly recognizing nothing new was revealed. Demonstrating both the extract case and
-    // the NONE case anchors the behavior far better, matching how the main chat prompt already
-    // relies on a demonstrated example turn rather than an instruction alone.
-    // Real bug found in usage (2026-08-02): the model once misattributed Xenon's *own* stated
-    // name as a fact about the user ("The user's name is Xenon") after being asked "What is your
-    // name?" -- added a dedicated example so it's explicit that facts about Xenon itself never
-    // count as facts about the user, the same conflation risk as the NONE examples below.
-    format!(
-        "Xenon only records a fact if the user directly stated it about *themselves*. Facts \
-         Xenon states about itself (its own name, its own capabilities) are never facts about \
-         the user. If the user did not clearly state something new and durable about \
-         themselves, Xenon replies with exactly: NONE\n\n\
-         User: My favorite color is blue and I have a dog named Rex.\n\n\
-         Xenon: That's lovely! Rex sounds like a great dog.\n\n\
-         Fact: The user's favorite color is blue and they have a dog named Rex.\n\n\
-         User: What's the weather like today?\n\n\
-         Xenon: I don't have access to real-time weather data.\n\n\
-         Fact: NONE\n\n\
-         User: What is my name?\n\n\
-         Xenon: I'm sorry, I don't have that information. Can you tell me your name?\n\n\
-         Fact: NONE\n\n\
-         User: What is your name?\n\n\
-         Xenon: My name is Xenon.\n\n\
-         Fact: NONE\n\n\
-         User: {user_text}\n\n\
-         Xenon: {reply_text}\n\n\
-         Fact:"
-    )
+/// The static half of the extraction prompt -- everything except the just-completed exchange
+/// itself. Byte-identical on every extraction call, so it's prefilled once into
+/// `EngineInner::extraction_prefix` at `load_engine` time (see that field's doc comment) instead
+/// of being re-evaluated on every Sloth turn (measured before Phase 8: 205 tokens, every time).
+/// Kept deliberately strict ("reply with exactly: NONE") since this is a small,
+/// non-instruction-tuned base model -- without a strong steer it tends to invent something
+/// rather than correctly recognize "nothing new here". Few-shot, not just an abstract
+/// instruction -- a bare "extract a fact or say NONE" instruction was found to make this small
+/// base model *invent* a plausible-sounding fact (e.g. "named John, loves pizza") even when the
+/// user never said any such thing, rather than correctly recognizing nothing new was revealed.
+/// Real bug found in usage (2026-08-02): the model once misattributed Xenon's *own* stated name
+/// as a fact about the user ("The user's name is Xenon") after being asked "What is your name?"
+/// -- added a dedicated example so it's explicit that facts about Xenon itself never count as
+/// facts about the user, the same conflation risk as the NONE examples below.
+const EXTRACTION_STATIC_PREFIX: &str =
+    "Xenon only records a fact if the user directly stated it about *themselves*. Facts \
+     Xenon states about itself (its own name, its own capabilities) are never facts about \
+     the user. If the user did not clearly state something new and durable about \
+     themselves, Xenon replies with exactly: NONE\n\n\
+     User: My favorite color is blue and I have a dog named Rex.\n\n\
+     Xenon: That's lovely! Rex sounds like a great dog.\n\n\
+     Fact: The user's favorite color is blue and they have a dog named Rex.\n\n\
+     User: What's the weather like today?\n\n\
+     Xenon: I don't have access to real-time weather data.\n\n\
+     Fact: NONE\n\n\
+     User: What is my name?\n\n\
+     Xenon: I'm sorry, I don't have that information. Can you tell me your name?\n\n\
+     Fact: NONE\n\n\
+     User: What is your name?\n\n\
+     Xenon: My name is Xenon.\n\n\
+     Fact: NONE\n\n";
+
+/// The volatile (per-call) half of the extraction prompt: just this turn's exchange.
+fn build_extraction_suffix(user_text: &str, reply_text: &str) -> String {
+    format!("User: {user_text}\n\nXenon: {reply_text}\n\nFact:")
 }
 
-/// Runs the Sloth fact-extraction step: a second, small, low-temperature generate() call using
-/// the just-completed turn, under the *same* already-held engine lock as the main reply (kept
+/// Runs the Sloth fact-extraction step: a second, small, low-temperature generate call using the
+/// just-completed turn, under the *same* already-held engine lock as the main reply (kept
 /// sequential rather than concurrent -- rwkv.cpp's per-engine state isn't safe for concurrent
-/// eval calls, see `EngineState`'s doc comment, and this call is short at `max_tokens=40`). On
-/// success, persists any real fact via `sloth_memory::append_fact` and emits
-/// `sloth-facts-updated` so an open Memory panel (see App.vue) can refresh live. Never surfaces
-/// its own errors as a `generation-error` -- a failed/garbled extraction just means no new fact
-/// gets remembered this turn, which shouldn't interrupt or error out the visible reply that
-/// already completed successfully.
+/// eval calls, see `EngineInner`'s doc comment, and this call is short at `max_tokens=40`).
+/// Always starts from a fresh copy of `extraction_prefix` and discards it afterwards -- this
+/// call must never be able to read or write a conversation's cached state in
+/// `EngineInner::conversation_cache` (Phase 8 requirement: extraction is a side channel, not a
+/// second turn of the actual conversation). On success, persists any real fact via
+/// `sloth_memory::append_fact` and emits `sloth-facts-updated` so an open Memory panel (see
+/// App.vue) can refresh live. Never surfaces its own errors as a `generation-error` -- a
+/// failed/garbled extraction just means no new fact gets remembered this turn, which shouldn't
+/// interrupt or error out the visible reply that already completed successfully.
 fn run_fact_extraction(
     engine: *mut ffi::XenonEngine,
+    extraction_prefix: &XenonStatePtr,
     app: &AppHandle,
     user_text: &str,
     reply_text: &str,
 ) {
-    let prompt = match CString::new(build_extraction_prompt(user_text, reply_text)) {
+    let suffix = match CString::new(build_extraction_suffix(user_text, reply_text)) {
         Ok(c) => c,
         Err(_) => return,
     };
+
+    let scratch = unsafe { ffi::xenon_state_new(engine) };
+    unsafe { ffi::xenon_state_copy(scratch, extraction_prefix.0) };
 
     let buf = RefCell::new(String::new());
     let buf_ptr = &buf as *const RefCell<String> as *mut c_void;
 
     let status = unsafe {
-        ffi::xenon_generate(
+        ffi::xenon_generate_with_state(
             engine,
-            prompt.as_ptr(),
+            scratch,
+            suffix.as_ptr(),
             40,   // max_tokens -- one short sentence, not a full reply
             0.2,  // temperature -- extraction should be far more deterministic than a chat reply
             0.2,  // top_p
@@ -369,6 +475,7 @@ fn run_fact_extraction(
             buf_ptr,
         )
     };
+    unsafe { ffi::xenon_state_free(scratch) };
     if status != ffi::XenonStatus::OK {
         return;
     }
@@ -447,29 +554,133 @@ fn now_millis() -> i64 {
         .unwrap_or(0)
 }
 
+/// Feeds `text` into `state` via `xenon_prefill`, mapping the C error into a `Result` instead of
+/// silently ignoring it. `text` == "" is a cheap no-op (see `xenon_prefill`'s doc comment).
+fn prefill_text(engine: *mut ffi::XenonEngine, state: *mut ffi::XenonState, text: &str) -> Result<(), String> {
+    let c_text = CString::new(text).map_err(|e| format!("prefill text contained an embedded NUL byte: {e}"))?;
+    let status = unsafe { ffi::xenon_prefill(engine, state, c_text.as_ptr()) };
+    if status == ffi::XenonStatus::OK {
+        Ok(())
+    } else {
+        Err(last_error())
+    }
+}
+
+/// The heart of Phase 8: given the turns already known to have happened (`prior_turns` --
+/// everything in this call's `history` except the newest, not-yet-answered user turn), returns a
+/// pointer to a state that has consumed exactly `STATIC_PREFIX` + `history_text(prior_turns)`,
+/// reusing as much of `inner.conversation_cache` as possible instead of rebuilding from scratch.
+///
+/// Diff logic: if this conversation has a cache entry whose `consumed` turns are a byte-equal
+/// prefix of `prior_turns`, this is a plain continuation (or a regenerate of the last reply, which
+/// sends the identical `prior_turns` as before) -- "extend" by prefilling only the new tail turns.
+/// Otherwise (no entry yet, an evicted entry, or `prior_turns` diverges anywhere -- an edit to an
+/// earlier message, a delete, or a shorter history) -- "rebuild" from a fresh copy of
+/// `static_prefix`, prefilling all of `prior_turns`. Either way, `consumed` is set to
+/// `prior_turns` *before* this turn generates anything, from `history` text the frontend already
+/// considers canonical -- this cache is never advanced from this turn's own (possibly still to be
+/// trimmed, see `chat.ts`'s `completeGeneration`) generation output. See `EngineInner`'s doc
+/// comment and this phase's design notes for why that ordering is what makes the cache safe
+/// against edits/regenerates/the frontend's post-hoc trimming without any special-casing here.
+fn ensure_cache_extended(
+    inner: &mut EngineInner,
+    conversation_id: &str,
+    prior_turns: &[ChatTurn],
+) -> Result<*mut ffi::XenonState, String> {
+    let engine = inner.engine.0;
+
+    if let Some(idx) = inner
+        .conversation_cache
+        .iter()
+        .position(|(id, _)| id == conversation_id)
+    {
+        let is_extendable = {
+            let cached = &inner.conversation_cache[idx].1;
+            cached.consumed.len() <= prior_turns.len() && cached.consumed == prior_turns[..cached.consumed.len()]
+        };
+
+        if is_extendable {
+            let cached = &mut inner.conversation_cache[idx].1;
+            let delta = &prior_turns[cached.consumed.len()..];
+            if !delta.is_empty() {
+                prefill_text(engine, cached.state.0, &history_text(delta))?;
+            }
+            cached.consumed = prior_turns.to_vec();
+
+            // Move to the back (most-recently-used) so LRU eviction below doesn't pick this one.
+            let entry = inner.conversation_cache.remove(idx);
+            inner.conversation_cache.push(entry);
+            return Ok(inner.conversation_cache.last().unwrap().1.state.0);
+        }
+
+        // Diverges somewhere -- stale relative to what the frontend just sent (an edit, a
+        // delete, or otherwise). Drop it and rebuild below.
+        inner.conversation_cache.remove(idx);
+    }
+
+    let new_state = unsafe { ffi::xenon_state_new(engine) };
+    unsafe { ffi::xenon_state_copy(new_state, inner.static_prefix.0) };
+    if let Err(e) = prefill_text(engine, new_state, &history_text(prior_turns)) {
+        unsafe { ffi::xenon_state_free(new_state) };
+        return Err(e);
+    }
+
+    if inner.conversation_cache.len() >= MAX_CACHED_CONVERSATIONS {
+        inner.conversation_cache.remove(0); // least-recently-used is always at the front
+    }
+    inner.conversation_cache.push((
+        conversation_id.to_string(),
+        CachedConversation { consumed: prior_turns.to_vec(), state: XenonStatePtr(new_state) },
+    ));
+    Ok(inner.conversation_cache.last().unwrap().1.state.0)
+}
+
 /// Runs generation to completion on the calling thread (blocking) and emits Tauri events as
 /// tokens stream in. Meant to be called from inside `spawn_blocking` by the IPC command below,
-/// never directly on the async/event-loop thread. Takes the already-locked engine pointer so the
-/// mutex stays held for the full duration of the call (see `EngineState` doc comment). `agent`
+/// never directly on the async/event-loop thread. Takes the already-locked `EngineInner` so the
+/// mutex stays held for the full duration of the call (see `EngineInner` doc comment). `agent`
 /// ("dementia" | "sloth") controls whether Sloth's persistent facts are injected into the prompt
 /// and whether a fact-extraction pass runs after a successful reply -- Dementia leaves both
 /// skipped, matching the app's pre-Sloth behavior exactly.
 fn generate_blocking(
-    engine: *mut ffi::XenonEngine,
+    inner: &mut EngineInner,
     app: AppHandle,
     conversation_id: String,
     history: Vec<ChatTurn>,
     agent: String,
 ) {
-    if let Some(last_user_text) = history.iter().rev().find(|t| t.role == "user").map(|t| t.content.as_str()) {
-        if let Some(answer) = try_answer_time_date_deterministically(last_user_text) {
+    let engine = inner.engine.0;
+
+    // `prior_turns` is everything already-happened; the newest user turn is what this call
+    // answers. Both the deterministic short-circuit below and the real generation path share
+    // the same cache-extend step so the cache never falls behind regardless of which path a
+    // given turn takes.
+    let (prior_turns, new_user_turn) = match history.split_last() {
+        Some((last, rest)) => (rest, last),
+        None => {
             let _ = app.emit(
-                "token-stream",
-                TokenEvent { conversation_id: conversation_id.clone(), text: answer },
+                "generation-error",
+                GenerationErrorEvent { conversation_id, message: "generate_response called with empty history".to_string() },
             );
-            let _ = app.emit("generation-done", GenerationDoneEvent { conversation_id });
             return;
         }
+    };
+
+    let base_state = match ensure_cache_extended(inner, &conversation_id, prior_turns) {
+        Ok(s) => s,
+        Err(message) => {
+            let _ = app.emit("generation-error", GenerationErrorEvent { conversation_id, message });
+            return;
+        }
+    };
+
+    if let Some(answer) = try_answer_time_date_deterministically(&new_user_turn.content) {
+        let _ = app.emit(
+            "token-stream",
+            TokenEvent { conversation_id: conversation_id.clone(), text: answer },
+        );
+        let _ = app.emit("generation-done", GenerationDoneEvent { conversation_id });
+        return;
     }
 
     let is_sloth = agent == "sloth";
@@ -479,10 +690,22 @@ fn generate_blocking(
         Vec::new()
     };
 
-    let prompt = build_prompt(&history, &facts);
-    let prompt_c = match CString::new(prompt) {
+    // Never generate directly into the authoritative cached state (`base_state`) -- see
+    // `ensure_cache_extended`'s doc comment on why the cache only ever advances from
+    // caller-confirmed history text, never from this turn's own raw generation output. Copy it
+    // into a scratch state, feed the volatile header + new turn, generate there, then discard.
+    let turn_state = unsafe { ffi::xenon_state_new(engine) };
+    unsafe { ffi::xenon_state_copy(turn_state, base_state) };
+
+    let suffix = format!(
+        "{}User: {}\n\nXenon:",
+        volatile_header_text(&facts),
+        new_user_turn.content.trim()
+    );
+    let suffix_c = match CString::new(suffix) {
         Ok(c) => c,
         Err(e) => {
+            unsafe { ffi::xenon_state_free(turn_state) };
             let _ = app.emit(
                 "generation-error",
                 GenerationErrorEvent {
@@ -503,9 +726,10 @@ fn generate_blocking(
     let ctx_ptr = &ctx as *const CallbackCtx as *mut c_void;
 
     let status = unsafe {
-        ffi::xenon_generate(
+        ffi::xenon_generate_with_state(
             engine,
-            prompt_c.as_ptr(),
+            turn_state,
+            suffix_c.as_ptr(),
             200,  // max_tokens
             0.8,  // temperature (matches Phase 1 CLI harness default)
             0.5,  // top_p (matches Phase 1 CLI harness default)
@@ -524,16 +748,12 @@ fn generate_blocking(
         )
     };
 
+    unsafe { ffi::xenon_state_free(turn_state) };
+
     if status == ffi::XenonStatus::OK {
         if is_sloth {
-            let user_text = history
-                .iter()
-                .rev()
-                .find(|t| t.role == "user")
-                .map(|t| t.content.as_str())
-                .unwrap_or("");
             let reply_text = ctx.full_text.borrow();
-            run_fact_extraction(engine, &app, user_text, &reply_text);
+            run_fact_extraction(engine, &inner.extraction_prefix, &app, &new_user_turn.content, &reply_text);
         }
         let _ = app.emit("generation-done", GenerationDoneEvent { conversation_id });
     } else {
@@ -561,13 +781,14 @@ pub async fn generate_response(
     let engine_arc = engine.0.clone();
 
     tauri::async_runtime::spawn_blocking(move || {
-        // Held for the entire blocking generate() call (and, for Sloth, the extraction call
-        // right after it) -- see EngineState's doc comment.
-        let guard = match engine_arc.lock() {
+        // Held for the entire blocking generate() call (cache lookups/extends, the generate
+        // call itself, and, for Sloth, the extraction call right after it) -- see `EngineInner`'s
+        // doc comment.
+        let mut guard = match engine_arc.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        generate_blocking(guard.0, app, conversation_id, history, agent);
+        generate_blocking(&mut guard, app, conversation_id, history, agent);
     })
     .await
     .map_err(|e| e.to_string())

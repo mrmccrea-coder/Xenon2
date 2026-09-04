@@ -1,4 +1,4 @@
-# Xenon2 — Phase 3/4/5/6/7: Desktop Shell, Chat UI, Editing, File Save/Load, Export/Import, Hardening
+# Xenon2 — Phase 3/4/5/6/7/8: Desktop Shell, Chat UI, Editing, File Save/Load, Export/Import, Hardening, Persistent State
 
 A Tauri 2 + Vue 3 desktop chat app: sidebar + main chat panel, ChatGPT/Claude-Desktop-style
 layout. Phase 3 (see `../PLAN.md` and `../prompts/phase3_prompt.md`) built the shell, layout, and
@@ -356,11 +356,10 @@ substitution described above.
     rwkv.cpp's per-engine state isn't designed for concurrent eval calls).
   - Exposes `#[tauri::command] generate_response(conversation_id, history)`, called from the
     Vue frontend via `invoke("generate_response", ...)` in `App.vue`'s `sendMessage()`. It builds
-    the same "User: ... / Xenon: ..." chat-style prompt prime Phase 1's CLI harness uses (extended
-    to include the full turn history, since `xenon_generate` resets RWKV state at the start of
-    every call — there's no cross-call incremental state yet), then runs the actual blocking
-    `xenon_generate()` call inside `tauri::async_runtime::spawn_blocking` so it doesn't block the
-    Tauri event loop.
+    the same "User: ... / Xenon: ..." chat-style prompt prime Phase 1's CLI harness uses, then runs
+    the actual blocking generation call inside `tauri::async_runtime::spawn_blocking` so it doesn't
+    block the Tauri event loop. **As of Phase 8** this no longer re-feeds the whole conversation
+    every turn — see "Phase 8: persistent RWKV state" below.
   - The token callback (`on_token`, a real `extern "C" fn`, not a stub) emits a Tauri event
     `token-stream` (payload `{ conversationId, text }`) for every non-empty decoded chunk as
     `xenon_generate` produces it — this is what drives the incremental, token-by-token rendering
@@ -686,3 +685,62 @@ the toggle and the Memory panel):
   two agents are actually isolated, not just cosmetically labeled.
 - The Sloth Memory panel, opened via a real File-menu click (not just an `invoke()` call), showed
   both stored facts with working per-fact delete buttons -- screenshotted via `PrintWindow`.
+
+## Phase 8: persistent RWKV state (stop re-prefilling the prompt)
+
+Every point above that describes `generate_response` re-sending "the entire conversation history
+as text" on every call, because "there's no incremental RWKV state across calls", was true through
+Phase 7 and is no longer true. `inference-engine`'s `xenon_generate()` used to reset RWKV state on
+every call, so `inference.rs`'s prompt builder had to re-serialize the whole conversation as text
+every turn, and the engine had to re-evaluate all of it before producing one new token -- a cost
+that grew without bound the longer a conversation went on. RWKV's whole point is a fixed-size
+recurrent state that makes that unnecessary; this phase actually uses it.
+
+**What changed:**
+- `inference-engine` gained a caller-owned `xenon_state` type plus `xenon_prefill` /
+  `xenon_generate_with_state` (full details, API, and the correctness proof in
+  `inference-engine/README.md`'s "Persistent state across calls" section). `xenon_generate()`'s
+  signature and behavior are unchanged -- it's now a thin wrapper over the new API, so the two
+  existing direct callers of that signature (`voice-pipeline/xenon_engine.py`, `test_inference.cpp`)
+  needed no changes.
+- `inference.rs`'s old single `build_prompt()` split into three pieces: a `STATIC_PREFIX` (the
+  instruction + demo turns, byte-identical forever, prefilled once at engine load), `history_text`
+  (the growing per-conversation history, cached and extended incrementally), and
+  `volatile_header_text` (the real-clock grounding + Sloth facts + time-example turn, which has to
+  be re-fed every single turn regardless of caching since it changes every call). The volatile
+  header moved from the *front* of the prompt to *just before* the new turn -- a value that
+  changes every call can't sit at the front of a prompt whose tail is supposed to be cacheable,
+  since RWKV state is strictly sequential (change position 0, invalidate everything after it).
+  Wording and content are unchanged from Phase 7, only the ordering moved; sanity-checked against
+  the old ordering on real prompts (coherent, on-topic, correctly-answered arithmetic, no
+  regression in the "doesn't end every reply with a question" style fix) before shipping it.
+- `EngineState`'s inner type grew from a bare engine pointer to an `EngineInner` holding the
+  engine, the one-time static-prefix state, a separate one-time state for the Sloth
+  fact-extraction preamble, and a small LRU cache (`MAX_CACHED_CONVERSATIONS = 4`) of
+  per-conversation state. Each incoming `generate_response` call diffs the history it's sent
+  against what a conversation's cache entry has already consumed: an unchanged prefix means
+  "extend" (prefill just the new tail turns); a divergence anywhere (an edit to an earlier
+  message, Phase 7's delete-message feature, or a shorter history) means "rebuild" from the shared
+  static prefix. The cache only ever advances from history text the frontend already sent (and
+  therefore already considers canonical) -- generation for the turn being answered right now
+  always runs on a throwaway copy, never the authoritative cache entry, so the frontend's
+  post-generation trimming (`chat.ts`'s `completeGeneration`, which strips the stop-sequence tail
+  and a couple of canned-phrase backstops) can never desync the cache from what's actually shown.
+  Sloth fact-extraction runs against its own separate one-time state and never touches a
+  conversation's cached state at all.
+
+**Measured (RWKV-7 World 2.9B, this machine; full numbers and the correctness proof in
+`inference-engine/README.md`):** `xenon_get_state_len()` is 5,406,720 floats (20.62 MB) for this
+model. Tokens actually evaluated per turn dropped from a pattern that grows without bound (167 at
+turn 1, 420 by turn 10) to a flat ~83/turn regardless of how long the conversation gets. Wall time
+for a 20-token reply at turn 10 dropped from 16.97s to 4.65s on this machine. Steady-state
+per-token generation throughput is unaffected -- confirmed unchanged, since the generation loop
+itself wasn't touched, only what it reads/writes state from/to.
+
+**Correctness, proven not assumed**: `inference-engine/src/test_state_cache.cpp` asserts
+byte-identical output (text *and* token-id sequences) between the old full-reset-and-refeed path
+and the new incremental path, at turn 1, turn 5, after an edited earlier turn, and after a
+regenerate -- all four pass. Uses greedy decoding (`temperature = 0`) for full determinism without
+needing an RNG-seeding API, and keeps the repeat-penalty enabled (`1.3`, the production value)
+specifically because that's the part most likely to be subtly wrong under incremental prefill (see
+`inference-engine/README.md` for why it isn't).

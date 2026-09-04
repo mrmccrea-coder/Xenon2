@@ -13,6 +13,13 @@ pub struct XenonEngine {
     _private: [u8; 0],
 }
 
+/// Opaque, caller-owned RWKV state (Phase 8). Never dereferenced on the Rust side -- see
+/// `xenon_inference.h`'s docs on `xenon_state`.
+#[repr(C)]
+pub struct XenonState {
+    _private: [u8; 0],
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct XenonStatus(pub c_int);
@@ -40,6 +47,30 @@ extern "C" {
 
     pub fn xenon_generate(
         engine: *mut XenonEngine,
+        prompt: *const c_char,
+        max_tokens: c_int,
+        temperature: f32,
+        top_p: f32,
+        repeat_penalty: f32,
+        callback: XenonTokenCallback,
+        user_data: *mut c_void,
+    ) -> XenonStatus;
+
+    // --- Phase 8: caller-owned incremental state -- see xenon_inference.h's docs -------------
+
+    pub fn xenon_state_new(engine: *mut XenonEngine) -> *mut XenonState;
+
+    pub fn xenon_state_free(state: *mut XenonState);
+
+    pub fn xenon_state_copy(dst: *mut XenonState, src: *const XenonState);
+
+    pub fn xenon_state_reset(engine: *mut XenonEngine, state: *mut XenonState);
+
+    pub fn xenon_prefill(engine: *mut XenonEngine, state: *mut XenonState, text: *const c_char) -> XenonStatus;
+
+    pub fn xenon_generate_with_state(
+        engine: *mut XenonEngine,
+        state: *mut XenonState,
         prompt: *const c_char,
         max_tokens: c_int,
         temperature: f32,

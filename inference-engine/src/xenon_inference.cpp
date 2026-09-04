@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <numeric>
@@ -143,7 +145,25 @@ size_t utf8_safe_prefix_len(const std::string & buf) {
     return n;
 }
 
+// How many trailing tokens xenon_state keeps for the repeat-penalty window -- must match
+// REPEAT_PENALTY_WINDOW above (it's the same window, just persisted across calls instead of
+// recomputed from a full prompt every time; see xenon_inference.h's xenon_state docs).
+constexpr size_t STATE_RECENT_TOKENS_CAP = REPEAT_PENALTY_WINDOW;
+
 } // namespace
+
+// Everything that used to live directly on xenon_engine (Phase 1-7) now lives here instead, so a
+// caller can hold several independent conversations against one loaded engine (Phase 8). Defined
+// before xenon_engine below because xenon_engine's legacy_state member needs a complete type.
+struct xenon_state {
+    std::vector<float> state;
+    std::vector<float> logits;
+    // Rolling window of the last STATE_RECENT_TOKENS_CAP tokens actually fed into or generated
+    // from this state, in feed order. Kept persistently (rather than recomputed from a full
+    // prompt like the old per-call `recent_tokens` local) so repeat-penalty behavior under
+    // incremental prefill is identical to a full re-feed every time -- see xenon_prefill.
+    std::vector<uint32_t> recent_tokens;
+};
 
 struct xenon_engine {
     rwkv_context * ctx = nullptr;
@@ -154,15 +174,145 @@ struct xenon_engine {
     size_t state_len = 0;
     size_t logits_len = 0;
 
-    std::vector<float> state;
-    std::vector<float> logits;
-
     std::mt19937 rng{std::random_device{}()};
+
+    // Lazily allocated on first use by the legacy xenon_reset_state(engine)/xenon_generate() path
+    // only -- see those functions. Nothing in this codebase actually calls xenon_reset_state
+    // directly any more (Phase 8 callers use xenon_state_reset on their own xenon_state), but it
+    // stays part of the public C API for anyone binding against this header.
+    std::unique_ptr<xenon_state> legacy_state;
 
     ~xenon_engine() {
         if (ctx) rwkv_free(ctx);
     }
 };
+
+namespace {
+
+void push_recent_tokens(xenon_state * state, const uint32_t * tokens, size_t count) {
+    state->recent_tokens.insert(state->recent_tokens.end(), tokens, tokens + count);
+    size_t n = state->recent_tokens.size();
+    if (n > STATE_RECENT_TOKENS_CAP) {
+        state->recent_tokens.erase(state->recent_tokens.begin(), state->recent_tokens.begin() + (n - STATE_RECENT_TOKENS_CAP));
+    }
+}
+
+// Shared by xenon_prefill and xenon_generate_with_state's initial-prompt step: encode `text` and
+// evaluate it into `state` (state_in == state_out == state->state.data()), updating cached
+// logits and the repeat-penalty window. Returns the encoded token count via `out_token_count`
+// (0 if `text` is empty -- caller decides whether that's an error or a no-op).
+bool eval_text_into_state(
+    xenon_engine * engine,
+    xenon_state * state,
+    const char * text,
+    size_t * out_token_count
+) {
+    *out_token_count = 0;
+    if (!text || text[0] == '\0') {
+        return true; // nothing to do; not an error at this layer
+    }
+
+    std::vector<uint32_t> tokens;
+    try {
+        tokens = engine->tokenizer->encode(text);
+    } catch (const std::exception & e) {
+        set_last_error(std::string("xenon_inference: tokenizer encode failed: ") + e.what());
+        return false;
+    }
+
+    if (tokens.empty()) {
+        return true;
+    }
+
+    bool ok = rwkv_eval_sequence_in_chunks(
+        engine->ctx,
+        tokens.data(),
+        tokens.size(),
+        /* chunk_size */ 16,
+        /* state_in */ state->state.data(),
+        /* state_out */ state->state.data(),
+        /* logits_out */ state->logits.data()
+    );
+    if (!ok) {
+        set_last_error("xenon_inference: rwkv_eval_sequence_in_chunks failed");
+        return false;
+    }
+
+    push_recent_tokens(state, tokens.data(), tokens.size());
+    *out_token_count = tokens.size();
+
+    // Phase 8 measurement instrumentation: prints the actual number of tokens evaluated on this
+    // call when XENON_DEBUG_PREFILL_COUNT is set, so before/after prefill-cost claims can be
+    // measured directly instead of estimated from prompt character counts. Off by default (zero
+    // cost in the hot path otherwise) -- getenv is only called once per eval, not once per token.
+    if (std::getenv("XENON_DEBUG_PREFILL_COUNT")) {
+        fprintf(stderr, "[xenon_inference] evaluated %zu token(s)\n", tokens.size());
+    }
+
+    return true;
+}
+
+// Shared generation loop, used by both xenon_generate_with_state and (via a scratch state)
+// xenon_generate. Assumes `state->logits` already holds valid logits for the next token to
+// sample (i.e. something -- prefill or a previous generate call -- has evaluated at least one
+// token into `state`).
+xenon_status run_generation_loop(
+    xenon_engine * engine,
+    xenon_state * state,
+    int max_tokens,
+    float temperature,
+    float top_p,
+    float repeat_penalty,
+    xenon_token_callback callback,
+    void * user_data
+) {
+    std::string pending_utf8; // holds back incomplete multi-byte UTF-8 sequences
+
+    for (int i = 0; i < max_tokens; i++) {
+        uint32_t token = sample_logits(
+            state->logits.data(), engine->n_vocab, temperature, top_p,
+            repeat_penalty, state->recent_tokens, engine->rng
+        );
+
+        push_recent_tokens(state, &token, 1);
+
+        const std::string & token_bytes = engine->tokenizer->decode_token(token);
+        pending_utf8 += token_bytes;
+
+        size_t safe_len = utf8_safe_prefix_len(pending_utf8);
+        std::string to_emit = pending_utf8.substr(0, safe_len);
+        pending_utf8.erase(0, safe_len);
+
+        bool keep_going = callback(to_emit.c_str(), token, user_data);
+        if (!keep_going) {
+            return XENON_OK;
+        }
+
+        if (i + 1 < max_tokens) {
+            bool ok = rwkv_eval(
+                engine->ctx,
+                token,
+                state->state.data(),
+                state->state.data(),
+                state->logits.data()
+            );
+
+            if (!ok) {
+                set_last_error("xenon_inference: rwkv_eval failed at token " + std::to_string(i));
+                return XENON_ERROR_EVAL;
+            }
+        }
+    }
+
+    // Flush any leftover (possibly-invalid) tail bytes so callers don't silently lose them.
+    if (!pending_utf8.empty()) {
+        callback(pending_utf8.c_str(), 0, user_data);
+    }
+
+    return XENON_OK;
+}
+
+} // namespace
 
 extern "C" {
 
@@ -216,9 +366,6 @@ XENON_API xenon_engine * xenon_load_model(
         return nullptr;
     }
 
-    engine->state.resize(engine->state_len);
-    engine->logits.resize(engine->logits_len);
-
     return engine.release();
 }
 
@@ -226,9 +373,92 @@ XENON_API void xenon_free_engine(xenon_engine * engine) {
     delete engine;
 }
 
+// Phase 8 follow-up: xenon_engine no longer owns a state at all (see the struct above), so this
+// legacy entry point now manages a single lazily-allocated scratch xenon_state internally --
+// good enough for the two remaining direct callers of the old signature (voice-pipeline's
+// ctypes bindings, test_inference.cpp), neither of which ever called this concurrently on the
+// same engine from multiple threads (same discipline as before: this whole API isn't
+// thread-safe per engine, see xenon_inference.h).
 XENON_API void xenon_reset_state(xenon_engine * engine) {
     if (!engine) return;
-    rwkv_init_state(engine->ctx, engine->state.data());
+    if (!engine->legacy_state) {
+        engine->legacy_state.reset(xenon_state_new(engine));
+    }
+    xenon_state_reset(engine, engine->legacy_state.get());
+}
+
+XENON_API xenon_state * xenon_state_new(xenon_engine * engine) {
+    if (!engine) return nullptr;
+    auto state = std::make_unique<xenon_state>();
+    state->state.resize(engine->state_len);
+    state->logits.resize(engine->logits_len);
+    return state.release();
+}
+
+XENON_API void xenon_state_free(xenon_state * state) {
+    delete state;
+}
+
+XENON_API void xenon_state_copy(xenon_state * dst, const xenon_state * src) {
+    if (!dst || !src) return;
+    dst->state = src->state;
+    dst->logits = src->logits;
+    dst->recent_tokens = src->recent_tokens;
+}
+
+XENON_API void xenon_state_reset(xenon_engine * engine, xenon_state * state) {
+    if (!engine || !state) return;
+    rwkv_init_state(engine->ctx, state->state.data());
+    std::fill(state->logits.begin(), state->logits.end(), 0.0f);
+    state->recent_tokens.clear();
+}
+
+XENON_API xenon_status xenon_prefill(
+    xenon_engine * engine,
+    xenon_state * state,
+    const char * text
+) {
+    if (!engine || !state) {
+        set_last_error("xenon_prefill: invalid arguments");
+        return XENON_ERROR_ARGS;
+    }
+    size_t n_tokens = 0;
+    if (!eval_text_into_state(engine, state, text, &n_tokens)) {
+        return XENON_ERROR_EVAL;
+    }
+    return XENON_OK;
+}
+
+XENON_API xenon_status xenon_generate_with_state(
+    xenon_engine * engine,
+    xenon_state * state,
+    const char * prompt,
+    int max_tokens,
+    float temperature,
+    float top_p,
+    float repeat_penalty,
+    xenon_token_callback callback,
+    void * user_data
+) {
+    if (!engine || !state || !prompt || !callback || max_tokens <= 0) {
+        set_last_error("xenon_generate_with_state: invalid arguments");
+        return XENON_ERROR_ARGS;
+    }
+
+    size_t n_tokens = 0;
+    if (!eval_text_into_state(engine, state, prompt, &n_tokens)) {
+        return XENON_ERROR_EVAL;
+    }
+    if (n_tokens == 0) {
+        // Matches xenon_generate()'s long-standing behavior: an empty/zero-token prompt is
+        // rejected rather than silently generating from whatever logits happen to already be in
+        // `state` (which may be all-zero garbage if this is a freshly-reset state that was never
+        // primed with xenon_prefill first).
+        set_last_error("xenon_generate_with_state: prompt encoded to zero tokens");
+        return XENON_ERROR_ARGS;
+    }
+
+    return run_generation_loop(engine, state, max_tokens, temperature, top_p, repeat_penalty, callback, user_data);
 }
 
 XENON_API xenon_status xenon_generate(
@@ -241,104 +471,27 @@ XENON_API xenon_status xenon_generate(
     xenon_token_callback callback,
     void * user_data
 ) {
-    if (!engine || !prompt || !callback || max_tokens <= 0) {
+    if (!engine) {
         set_last_error("xenon_generate: invalid arguments");
         return XENON_ERROR_ARGS;
     }
 
-    std::vector<uint32_t> prompt_tokens;
-    try {
-        prompt_tokens = engine->tokenizer->encode(prompt);
-    } catch (const std::exception & e) {
-        set_last_error(std::string("xenon_generate: tokenizer encode failed: ") + e.what());
-        return XENON_ERROR_EVAL;
-    }
-
-    xenon_reset_state(engine);
-
-    // Feed the prompt. Using rwkv_eval_sequence_in_chunks is the recommended way to process a
-    // full prompt (chunked to stay within ggml's graph node limit and for better throughput
-    // than evaluating one token at a time), per rwkv.h's own docs.
-    if (!prompt_tokens.empty()) {
-        bool ok = rwkv_eval_sequence_in_chunks(
-            engine->ctx,
-            prompt_tokens.data(),
-            prompt_tokens.size(),
-            /* chunk_size */ 16,
-            /* state_in */ engine->state.data(),
-            /* state_out */ engine->state.data(),
-            /* logits_out */ engine->logits.data()
-        );
-
-        if (!ok) {
-            set_last_error("xenon_generate: rwkv_eval_sequence_in_chunks failed while processing prompt");
-            return XENON_ERROR_EVAL;
-        }
-    } else {
-        // Empty prompt: initialize state only, no logits yet -- evaluate a no-op pass isn't
-        // possible with zero tokens, so bail out with a clear error instead of guessing.
-        set_last_error("xenon_generate: prompt encoded to zero tokens");
+    // Byte-identical to the pre-Phase-8 body of this function, just reimplemented on top of a
+    // scratch xenon_state instead of fields that used to live directly on xenon_engine -- see
+    // xenon_inference.h's docs on xenon_generate vs. xenon_generate_with_state.
+    xenon_state * scratch = xenon_state_new(engine);
+    if (!scratch) {
+        set_last_error("xenon_generate: failed to allocate scratch state");
         return XENON_ERROR_ARGS;
     }
+    xenon_state_reset(engine, scratch);
 
-    // Seed the repetition-penalty window with the tail of the prompt itself (not just tokens
-    // generated during this call) -- this is what actually catches a canned phrase sitting a
-    // turn or two back in the resent conversation history, not only in-reply self-repetition.
-    std::vector<uint32_t> recent_tokens;
-    {
-        size_t tail_start = prompt_tokens.size() > REPEAT_PENALTY_WINDOW
-            ? prompt_tokens.size() - REPEAT_PENALTY_WINDOW
-            : 0;
-        recent_tokens.assign(prompt_tokens.begin() + tail_start, prompt_tokens.end());
-    }
+    xenon_status status = xenon_generate_with_state(
+        engine, scratch, prompt, max_tokens, temperature, top_p, repeat_penalty, callback, user_data
+    );
 
-    std::string pending_utf8; // holds back incomplete multi-byte UTF-8 sequences
-
-    for (int i = 0; i < max_tokens; i++) {
-        uint32_t token = sample_logits(
-            engine->logits.data(), engine->n_vocab, temperature, top_p,
-            repeat_penalty, recent_tokens, engine->rng
-        );
-
-        recent_tokens.push_back(token);
-        if (recent_tokens.size() > REPEAT_PENALTY_WINDOW) {
-            recent_tokens.erase(recent_tokens.begin());
-        }
-
-        const std::string & token_bytes = engine->tokenizer->decode_token(token);
-        pending_utf8 += token_bytes;
-
-        size_t safe_len = utf8_safe_prefix_len(pending_utf8);
-        std::string to_emit = pending_utf8.substr(0, safe_len);
-        pending_utf8.erase(0, safe_len);
-
-        bool keep_going = callback(to_emit.c_str(), token, user_data);
-        if (!keep_going) {
-            return XENON_OK;
-        }
-
-        if (i + 1 < max_tokens) {
-            bool ok = rwkv_eval(
-                engine->ctx,
-                token,
-                engine->state.data(),
-                engine->state.data(),
-                engine->logits.data()
-            );
-
-            if (!ok) {
-                set_last_error("xenon_generate: rwkv_eval failed at token " + std::to_string(i));
-                return XENON_ERROR_EVAL;
-            }
-        }
-    }
-
-    // Flush any leftover (possibly-invalid) tail bytes so callers don't silently lose them.
-    if (!pending_utf8.empty()) {
-        callback(pending_utf8.c_str(), 0, user_data);
-    }
-
-    return XENON_OK;
+    xenon_state_free(scratch);
+    return status;
 }
 
 XENON_API size_t xenon_get_state_len(xenon_engine * engine) {

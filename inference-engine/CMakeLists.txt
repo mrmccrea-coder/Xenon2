@@ -40,31 +40,42 @@ if (WIN32)
     target_link_libraries(test_inference PRIVATE psapi)
 endif()
 
-set_target_properties(xenon_inference test_inference PROPERTIES
+# Phase 8: correctness gate + measurement harness for the incremental state API (xenon_state_*,
+# xenon_prefill, xenon_generate_with_state) -- see the file's own top comment.
+add_executable(test_state_cache src/test_state_cache.cpp)
+target_link_libraries(test_state_cache PRIVATE xenon_inference)
+if (WIN32)
+    target_link_libraries(test_state_cache PRIVATE psapi)
+endif()
+
+set_target_properties(xenon_inference test_inference test_state_cache PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
-# rwkv.dll needs to be next to test_inference.exe to run without manually editing PATH.
-add_custom_command(TARGET test_inference POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${XENON_RWKV_BUILD_DIR}/bin/Release/rwkv.dll"
-        "$<TARGET_FILE_DIR:test_inference>/rwkv.dll"
-    COMMENT "Copying rwkv.dll next to test_inference.exe"
-)
+# rwkv.dll needs to be next to test_inference.exe / test_state_cache.exe to run without manually
+# editing PATH.
+foreach(_xenon_test_target test_inference test_state_cache)
+    add_custom_command(TARGET ${_xenon_test_target} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${XENON_RWKV_BUILD_DIR}/bin/Release/rwkv.dll"
+            "$<TARGET_FILE_DIR:${_xenon_test_target}>/rwkv.dll"
+        COMMENT "Copying rwkv.dll next to ${_xenon_test_target}.exe"
+    )
 
-# Follow-up fix: world_vocab.bin (the World tokenizer's vocab file) must ship next to
-# test_inference.exe so the build output folder is self-contained and the .exe can be run
-# directly from build-cpu-app/bin/Release or build-cuda-app/bin/Release without depending on
-# the current working directory being the project root. Previously this was a manual copy step
-# nobody remembered to run; test_inference.cpp's default --vocab now also resolves relative to
-# the executable's own directory (see get_exe_dir() there), so this copy is what makes that
-# default actually resolve to a real file.
-add_custom_command(TARGET test_inference POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_CURRENT_SOURCE_DIR}/data/world_vocab.bin"
-        "$<TARGET_FILE_DIR:test_inference>/world_vocab.bin"
-    COMMENT "Copying world_vocab.bin next to test_inference.exe"
-)
+    # Follow-up fix: world_vocab.bin (the World tokenizer's vocab file) must ship next to the
+    # test .exe so the build output folder is self-contained and it can be run directly from
+    # build-cpu-app/bin/Release or build-cuda-app/bin/Release without depending on the current
+    # working directory being the project root. Previously this was a manual copy step nobody
+    # remembered to run; both harnesses' default --vocab now also resolves relative to the
+    # executable's own directory (see get_exe_dir() in each), so this copy is what makes that
+    # default actually resolve to a real file.
+    add_custom_command(TARGET ${_xenon_test_target} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/data/world_vocab.bin"
+            "$<TARGET_FILE_DIR:${_xenon_test_target}>/world_vocab.bin"
+        COMMENT "Copying world_vocab.bin next to ${_xenon_test_target}.exe"
+    )
+endforeach()
 
 # Extra runtime DLLs discovered as real, hard requirements while getting this to actually run
 # (not just build) on this machine -- best-effort app-local deployment so test_inference.exe
