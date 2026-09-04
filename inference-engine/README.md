@@ -138,6 +138,67 @@ reproduce (`--correctness` runs the byte-identical proof above). Steady-state pe
 generation throughput is unaffected (the generation loop itself is untouched, just operating on
 `xenon_state` fields instead of fields that used to live directly on `xenon_engine`).
 
+## Fast sampling (Phase 10)
+
+The token sampler (`sampler.h`/`sampler.cpp`, called `xenon_sample_logits` -- pulled out of
+`xenon_inference.cpp` into its own file specifically so it can be unit-tested without a model,
+see `test_sampler.cpp`) used to do six full passes over the entire `n_vocab = 65536`-entry logit
+vector per token: heap-allocate four vocab-sized buffers, run `exp()` in double 65536 times, fully
+sort a 65536-element copy just to find a top-p cutoff, run `pow()` 65536 times to apply
+temperature, and build a `std::discrete_distribution` over the whole vocabulary just to draw one
+sample.
+
+**What changed**, all while keeping the *exact* one unavoidable pass (there's no way to know what
+fraction of the total probability mass the top-p nucleus represents without the true softmax
+denominator over the whole vocab, so that pass stays -- see the correctness reasoning in
+`sampler.cpp`'s top comment):
+- Repeat-penalty application now mutates the caller's logits buffer in place (safe -- every real
+  caller either overwrites it with the next `rwkv_eval()` before reading it again, or discards
+  the whole `xenon_state` it lives in without reading it again at all) using a reusable
+  stamped-epoch array instead of a fresh vocab-sized copy + `vector<bool>` every call.
+- The softmax numerator (`exp(logit - max)`) is now computed in `float`, not `double` -- the
+  audit's own finding specifically called out the double-precision `exp()` as wasteful.
+- The top-p cutoff is found via `std::nth_element` over a generous 2048-candidate set (average
+  `O(n)`) instead of a full `O(n log n)` sort of all 65536 entries, with a full-sort fallback for
+  the rare case where that candidate set doesn't cover the true nucleus (verified by a dedicated
+  test using a deliberately near-uniform/flat distribution -- see `test_sampler.cpp`).
+- Temperature is folded into the exponent (mathematically identical to the old
+  `pow(prob, 1/temperature)` -- see the derivation in `sampler.cpp`) and applied only to the
+  *surviving* top-p candidates, not the full vocab.
+- Sampling is a hand-rolled linear inverse-CDF walk over just the candidates, not a
+  `std::discrete_distribution` built over all 65536 entries.
+
+**Correctness, proven not assumed**: a subtly wrong version of this function produces
+plausible-but-wrong output that no smoke test catches -- every reply a user sees comes out of it.
+`test_sampler.cpp` needs no model file (it links `sampler.cpp` directly) and keeps a frozen,
+byte-for-byte copy of the pre-Phase-10 algorithm to compare against:
+- At `temperature = 0` (fully deterministic -- no RNG consumed at all on that path in either
+  implementation), asserts the exact same token across many synthetic logits snapshots
+  (including the adversarial near-uniform one), repeat-penalty on and off, across repeated
+  sequential calls (to stress the epoch-stamp reuse logic, not just a single call).
+- At `temperature > 0`, a single stochastic draw can't prove two samplers are equivalent
+  (`std::discrete_distribution` and a hand-rolled inverse-CDF consume the RNG stream differently
+  even given identical probabilities), so it draws many samples (20000) from each against the
+  same fixed logits and compares empirical frequencies with a generous statistical tolerance.
+- A dedicated test confirms the full-sort fallback path is genuinely exercised (not silently
+  skipped) and still matches the reference distribution.
+- Phase 8's own correctness gate (`test_state_cache.exe --correctness`, byte-identical
+  reset-and-refeed vs. incremental-state output) also still passes unchanged with this sampler in
+  place, confirming the two phases compose correctly.
+
+**Measured** (this machine, `temperature = 0.8`, `top_p = 0.5`, `repeat_penalty = 1.3`,
+`n_vocab = 65536`, system quiesced -- run `test_sampler.exe --benchmark` yourself, or the plain
+`test_sampler.exe` for the full correctness suite):
+```
+old (reference_sample_logits)   ~4.8-5.6 ms/token
+new (xenon_sample_logits)       ~1.0-1.5 ms/token      (roughly 4-5x faster on this step)
+```
+End-to-end, same machine, same prompt, sampler swapped via a real before/after build (not
+estimated): **7.69 -> 8.05 tokens/sec (+4.7%)**, closely matching the audit's own prediction
+(+4.3%) that `rwkv_eval`'s matmuls, not the sampler, dominate total per-token time on this
+model/hardware -- this phase removes real, measurable waste, but was never going to be the thing
+that unblocks the app's overall speed.
+
 ## Building
 
 `rwkv.cpp`'s C library and this project's wrapper/CLI are built as **two separate stages**, so

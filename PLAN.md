@@ -332,6 +332,46 @@ to the user's visible wait.
 
 ---
 
+## Phase 10 — Fast sampling (sampler hot-loop rewrite) [x]
+
+Performance phase, not new user-facing scope, closing a third finding from
+the same audit as Phases 8-9. The token sampler did six full passes over
+the entire 65536-entry vocab per token (four heap-allocated buffers, a
+double-precision `exp()` pass, a full `O(n log n)` sort just to find a
+top-p cutoff, a `pow()` pass for temperature, and a
+`std::discrete_distribution` built over the whole vocabulary) -- all to
+produce one sampled token.
+
+Pulled the sampler into its own file (`inference-engine/src/sampler.h`/
+`.cpp`) so it can be unit-tested without a model at all, and rewrote it to
+keep the one unavoidable full-vocab pass (the true softmax denominator) but
+remove the rest: in-place logits mutation with a reusable stamped-epoch
+array for repeat-penalty (no more per-call buffer copy), single-precision
+`exp()`, `std::nth_element` over a generous top-p candidate set instead of
+a full sort (with a full-sort fallback for the rare case that candidate set
+doesn't cover the true nucleus), temperature folded into the exponent and
+applied only to surviving candidates, and a hand-rolled inverse-CDF sample
+over just those candidates instead of `std::discrete_distribution` over the
+whole vocab.
+
+This is a place where a subtly wrong rewrite produces plausible-but-wrong
+output with no smoke test catching it -- every reply a user sees comes out
+of this function. `test_sampler.cpp` (needs no model, runs in seconds)
+keeps a frozen copy of the pre-Phase-10 algorithm and proves the rewrite
+matches it exactly at temperature=0 and matches its *distribution* (many
+draws, not one draw) at temperature>0, including a dedicated test for the
+top-p fallback path; Phase 8's own correctness gate also still passes
+unchanged with the new sampler in place. See
+`inference-engine/README.md`'s "Fast sampling" section for the full design
+and measured numbers: ~4-5x faster on the sampling step itself, and a real
+(not estimated) same-machine before/after of the actual app:
+**7.69 -> 8.05 tokens/sec (+4.7%)**, matching the audit's own prediction
+that `rwkv_eval`'s matmuls, not the sampler, dominate total per-token time
+on this model/hardware -- real, measurable waste removed, not a change
+that was ever going to unblock the app's overall speed by itself.
+
+---
+
 ## Future work (not yet scheduled)
 
 - Mamba backend as an alternative to RWKV, once `mamba.cpp` tooling matures.

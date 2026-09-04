@@ -25,6 +25,7 @@ target_include_directories(rwkv_imported INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/
 
 add_library(xenon_inference SHARED
     src/xenon_inference.cpp
+    src/sampler.cpp
     src/world_tokenizer.cpp
 )
 target_include_directories(xenon_inference PUBLIC src)
@@ -48,7 +49,14 @@ if (WIN32)
     target_link_libraries(test_state_cache PRIVATE psapi)
 endif()
 
-set_target_properties(xenon_inference test_inference test_state_cache PROPERTIES
+# Phase 10: correctness/distribution gate for the sampler rewrite (xenon_sample_logits, see
+# sampler.h/.cpp). Deliberately does NOT link xenon_inference or rwkv -- it compiles sampler.cpp
+# directly and needs no model file, no tokenizer, no rwkv.dll, so it runs in milliseconds and has
+# no dependency on XENON_RWKV_BUILD_DIR at all.
+add_executable(test_sampler src/test_sampler.cpp src/sampler.cpp)
+target_include_directories(test_sampler PRIVATE src)
+
+set_target_properties(xenon_inference test_inference test_state_cache test_sampler PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 

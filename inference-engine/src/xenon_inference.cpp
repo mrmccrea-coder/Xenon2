@@ -1,4 +1,5 @@
 #include "xenon_inference.h"
+#include "sampler.h"
 #include "world_tokenizer.h"
 
 #include "rwkv.h"
@@ -31,90 +32,6 @@ void set_last_error(const std::string & msg) {
 // resent conversation history (the actual failure mode this was added for), small enough that
 // scanning it every step is negligible next to the O(n_vocab) softmax pass below.
 constexpr size_t REPEAT_PENALTY_WINDOW = 256;
-
-// Softmax + temperature + top-p (nucleus) sampling, mirroring rwkv.cpp's python/sampling.py
-// reference implementation so behavior matches the rest of the rwkv.cpp ecosystem. `repeat_penalty`
-// (1.0 = disabled) applies the standard llama.cpp-style penalty to any token present in
-// `recent_tokens` before the softmax: divide positive logits, scale up negative ones, so recently
-// -seen tokens become less likely without being hard-banned.
-uint32_t sample_logits(
-    const float * raw_logits,
-    size_t n_vocab,
-    float temperature,
-    float top_p,
-    float repeat_penalty,
-    const std::vector<uint32_t> & recent_tokens,
-    std::mt19937 & rng
-) {
-    std::vector<float> logits_buf;
-    const float * logits = raw_logits;
-
-    if (repeat_penalty != 1.0f && repeat_penalty > 0.0f && !recent_tokens.empty()) {
-        logits_buf.assign(raw_logits, raw_logits + n_vocab);
-        std::vector<bool> penalized(n_vocab, false);
-        for (uint32_t t : recent_tokens) {
-            if (t < n_vocab && !penalized[t]) {
-                penalized[t] = true;
-                float & l = logits_buf[t];
-                l = (l > 0.0f) ? (l / repeat_penalty) : (l * repeat_penalty);
-            }
-        }
-        logits = logits_buf.data();
-    }
-
-    std::vector<float> probs(n_vocab);
-
-    float max_logit = *std::max_element(logits, logits + n_vocab);
-
-    double sum = 0.0;
-    for (size_t i = 0; i < n_vocab; i++) {
-        probs[i] = std::exp(static_cast<double>(logits[i] - max_logit));
-        sum += probs[i];
-    }
-    for (size_t i = 0; i < n_vocab; i++) {
-        probs[i] = static_cast<float>(probs[i] / sum);
-    }
-
-    if (temperature <= 0.0f) {
-        return static_cast<uint32_t>(std::max_element(probs.begin(), probs.end()) - probs.begin());
-    }
-
-    if (top_p < 1.0f && top_p > 0.0f) {
-        std::vector<float> sorted_probs = probs;
-        std::sort(sorted_probs.begin(), sorted_probs.end(), std::greater<float>());
-
-        double cumulative = 0.0;
-        float cutoff = sorted_probs.back();
-        for (float p : sorted_probs) {
-            cumulative += p;
-            if (cumulative > top_p) {
-                cutoff = p;
-                break;
-            }
-        }
-
-        for (size_t i = 0; i < n_vocab; i++) {
-            if (probs[i] < cutoff) probs[i] = 0.0f;
-        }
-    }
-
-    if (temperature != 1.0f) {
-        double s = 0.0;
-        for (size_t i = 0; i < n_vocab; i++) {
-            probs[i] = std::pow(probs[i], 1.0f / temperature);
-            s += probs[i];
-        }
-        for (size_t i = 0; i < n_vocab; i++) {
-            probs[i] = static_cast<float>(probs[i] / s);
-        }
-    } else {
-        double s = std::accumulate(probs.begin(), probs.end(), 0.0);
-        for (size_t i = 0; i < n_vocab; i++) probs[i] = static_cast<float>(probs[i] / s);
-    }
-
-    std::discrete_distribution<uint32_t> dist(probs.begin(), probs.end());
-    return dist(rng);
-}
 
 // Returns the length of the prefix of `buf` that consists of complete, valid UTF-8 sequences,
 // holding back a possibly-incomplete trailing multi-byte sequence for the next call. This lets
@@ -269,7 +186,7 @@ xenon_status run_generation_loop(
     std::string pending_utf8; // holds back incomplete multi-byte UTF-8 sequences
 
     for (int i = 0; i < max_tokens; i++) {
-        uint32_t token = sample_logits(
+        uint32_t token = xenon_sample_logits(
             state->logits.data(), engine->n_vocab, temperature, top_p,
             repeat_penalty, state->recent_tokens, engine->rng
         );
