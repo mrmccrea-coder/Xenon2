@@ -136,7 +136,7 @@ pub async fn pick_folder_dialog(_app: AppHandle, test_env_var: Option<String>) -
 
 #[derive(Debug, Clone, Serialize)]
 struct MemoryProgressEvent {
-    /// Bundle-relative label, e.g. "models/rwkv-5-world-0.4B-Q4_0.bin".
+    /// Bundle-relative label, e.g. "models/rwkv-7-world-2.9B-Q5_1.bin".
     file: String,
     #[serde(rename = "fileIndex")]
     file_index: usize,
@@ -239,8 +239,8 @@ struct PlanEntry {
 fn required_model_files(repo_root: &Path) -> Vec<PlanEntry> {
     vec![
         PlanEntry {
-            src: repo_root.join("models").join("rwkv-5-world-0.4B-Q4_0.bin"),
-            rel: "models/rwkv-5-world-0.4B-Q4_0.bin".to_string(),
+            src: repo_root.join("models").join("rwkv-7-world-2.9B-Q5_1.bin"),
+            rel: "models/rwkv-7-world-2.9B-Q5_1.bin".to_string(),
         },
         PlanEntry {
             src: repo_root
@@ -253,15 +253,15 @@ fn required_model_files(repo_root: &Path) -> Vec<PlanEntry> {
             src: repo_root
                 .join("voice-pipeline")
                 .join("models")
-                .join("en_US-lessac-medium.onnx"),
-            rel: "voice-models/en_US-lessac-medium.onnx".to_string(),
+                .join("en_GB-alan-medium.onnx"),
+            rel: "voice-models/en_GB-alan-medium.onnx".to_string(),
         },
         PlanEntry {
             src: repo_root
                 .join("voice-pipeline")
                 .join("models")
-                .join("en_US-lessac-medium.onnx.json"),
-            rel: "voice-models/en_US-lessac-medium.onnx.json".to_string(),
+                .join("en_GB-alan-medium.onnx.json"),
+            rel: "voice-models/en_GB-alan-medium.onnx.json".to_string(),
         },
     ]
 }
@@ -404,10 +404,10 @@ pub async fn import_memory(
 
         let mut plan: Vec<PlanEntry> = Vec::new();
 
-        if models_dir.join("rwkv-5-world-0.4B-Q4_0.bin").exists() {
+        if models_dir.join("rwkv-7-world-2.9B-Q5_1.bin").exists() {
             plan.push(PlanEntry {
-                src: models_dir.join("rwkv-5-world-0.4B-Q4_0.bin"),
-                rel: "models/rwkv-5-world-0.4B-Q4_0.bin".to_string(),
+                src: models_dir.join("rwkv-7-world-2.9B-Q5_1.bin"),
+                rel: "models/rwkv-7-world-2.9B-Q5_1.bin".to_string(),
             });
         }
         if models_dir.join("world_vocab.bin").exists() {
@@ -416,16 +416,16 @@ pub async fn import_memory(
                 rel: "inference-engine-data/world_vocab.bin".to_string(),
             });
         }
-        if voice_dir.join("en_US-lessac-medium.onnx").exists() {
+        if voice_dir.join("en_GB-alan-medium.onnx").exists() {
             plan.push(PlanEntry {
-                src: voice_dir.join("en_US-lessac-medium.onnx"),
-                rel: "voice-pipeline-models/en_US-lessac-medium.onnx".to_string(),
+                src: voice_dir.join("en_GB-alan-medium.onnx"),
+                rel: "voice-pipeline-models/en_GB-alan-medium.onnx".to_string(),
             });
         }
-        if voice_dir.join("en_US-lessac-medium.onnx.json").exists() {
+        if voice_dir.join("en_GB-alan-medium.onnx.json").exists() {
             plan.push(PlanEntry {
-                src: voice_dir.join("en_US-lessac-medium.onnx.json"),
-                rel: "voice-pipeline-models/en_US-lessac-medium.onnx.json".to_string(),
+                src: voice_dir.join("en_GB-alan-medium.onnx.json"),
+                rel: "voice-pipeline-models/en_GB-alan-medium.onnx.json".to_string(),
             });
         }
 

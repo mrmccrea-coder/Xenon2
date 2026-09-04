@@ -24,9 +24,42 @@ void set_last_error(const std::string & msg) {
     g_last_error = msg;
 }
 
+// How many trailing tokens (prompt tail + tokens generated so far this call) count toward the
+// repetition penalty. Large enough to cover a canned phrase sitting a turn or two back in the
+// resent conversation history (the actual failure mode this was added for), small enough that
+// scanning it every step is negligible next to the O(n_vocab) softmax pass below.
+constexpr size_t REPEAT_PENALTY_WINDOW = 256;
+
 // Softmax + temperature + top-p (nucleus) sampling, mirroring rwkv.cpp's python/sampling.py
-// reference implementation so behavior matches the rest of the rwkv.cpp ecosystem.
-uint32_t sample_logits(const float * logits, size_t n_vocab, float temperature, float top_p, std::mt19937 & rng) {
+// reference implementation so behavior matches the rest of the rwkv.cpp ecosystem. `repeat_penalty`
+// (1.0 = disabled) applies the standard llama.cpp-style penalty to any token present in
+// `recent_tokens` before the softmax: divide positive logits, scale up negative ones, so recently
+// -seen tokens become less likely without being hard-banned.
+uint32_t sample_logits(
+    const float * raw_logits,
+    size_t n_vocab,
+    float temperature,
+    float top_p,
+    float repeat_penalty,
+    const std::vector<uint32_t> & recent_tokens,
+    std::mt19937 & rng
+) {
+    std::vector<float> logits_buf;
+    const float * logits = raw_logits;
+
+    if (repeat_penalty != 1.0f && repeat_penalty > 0.0f && !recent_tokens.empty()) {
+        logits_buf.assign(raw_logits, raw_logits + n_vocab);
+        std::vector<bool> penalized(n_vocab, false);
+        for (uint32_t t : recent_tokens) {
+            if (t < n_vocab && !penalized[t]) {
+                penalized[t] = true;
+                float & l = logits_buf[t];
+                l = (l > 0.0f) ? (l / repeat_penalty) : (l * repeat_penalty);
+            }
+        }
+        logits = logits_buf.data();
+    }
+
     std::vector<float> probs(n_vocab);
 
     float max_logit = *std::max_element(logits, logits + n_vocab);
@@ -204,6 +237,7 @@ XENON_API xenon_status xenon_generate(
     int max_tokens,
     float temperature,
     float top_p,
+    float repeat_penalty,
     xenon_token_callback callback,
     void * user_data
 ) {
@@ -247,10 +281,29 @@ XENON_API xenon_status xenon_generate(
         return XENON_ERROR_ARGS;
     }
 
+    // Seed the repetition-penalty window with the tail of the prompt itself (not just tokens
+    // generated during this call) -- this is what actually catches a canned phrase sitting a
+    // turn or two back in the resent conversation history, not only in-reply self-repetition.
+    std::vector<uint32_t> recent_tokens;
+    {
+        size_t tail_start = prompt_tokens.size() > REPEAT_PENALTY_WINDOW
+            ? prompt_tokens.size() - REPEAT_PENALTY_WINDOW
+            : 0;
+        recent_tokens.assign(prompt_tokens.begin() + tail_start, prompt_tokens.end());
+    }
+
     std::string pending_utf8; // holds back incomplete multi-byte UTF-8 sequences
 
     for (int i = 0; i < max_tokens; i++) {
-        uint32_t token = sample_logits(engine->logits.data(), engine->n_vocab, temperature, top_p, engine->rng);
+        uint32_t token = sample_logits(
+            engine->logits.data(), engine->n_vocab, temperature, top_p,
+            repeat_penalty, recent_tokens, engine->rng
+        );
+
+        recent_tokens.push_back(token);
+        if (recent_tokens.size() > REPEAT_PENALTY_WINDOW) {
+            recent_tokens.erase(recent_tokens.begin());
+        }
 
         const std::string & token_bytes = engine->tokenizer->decode_token(token);
         pending_utf8 += token_bytes;

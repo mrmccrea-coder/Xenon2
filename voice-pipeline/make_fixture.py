@@ -21,8 +21,8 @@ import soundfile as sf
 from piper import PiperVoice
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-VOICE_MODEL = os.path.join(_THIS_DIR, "models", "en_US-lessac-medium.onnx")
-VOICE_CONFIG = os.path.join(_THIS_DIR, "models", "en_US-lessac-medium.onnx.json")
+VOICE_MODEL = os.path.join(_THIS_DIR, "models", "en_GB-alan-medium.onnx")
+VOICE_CONFIG = os.path.join(_THIS_DIR, "models", "en_GB-alan-medium.onnx.json")
 FIXTURES_DIR = os.path.join(_THIS_DIR, "fixtures")
 
 GREETING_TEXT = "Hello, how are you?"

@@ -15,7 +15,7 @@ python -m venv .venv
 pip install -r requirements.txt
 
 # One-time: fetch a piper voice model (used for TTS)
-python -m piper.download_voices --download-dir models en_US-lessac-medium
+python -m piper.download_voices --download-dir models en_GB-alan-medium
 
 # One-time: generate the sample WAV fixture used for automated testing (see below)
 python make_fixture.py
@@ -231,8 +231,13 @@ still returns exit code 0 for this case (it's expected behavior, not a failure).
 
 ## Known limitations / out of scope
 
-- No UI -- this is CLI-only, matching Phase 1's approach. Phase 3 wires a mic-toggle
-  button to this pipeline.
+- No UI -- this is CLI-only, matching Phase 1's approach. Phase 7 wires the desktop app's
+  mic button to this pipeline via a long-lived sidecar process, `ipc_server.py` (newline-delimited
+  JSON over stdin/stdout, spawned by `app/src-tauri/src/voice.rs`) -- see `app/README.md`'s
+  "Phase 7: hardening & voice input/output" section. `ipc_server.py` reuses `vad.py`/`stt.py`/
+  `tts.py`/`speech_streamer.py` unchanged; it deliberately does not import `xenon_engine.py` or
+  call `generate()` itself, since the desktop app's Rust side already owns the one loaded RWKV
+  engine and voice transcripts feed into the app's existing `sendMessage` path instead.
 - Live-mic *speech recognition accuracy* wasn't validated with an actual human voice in
   this environment (see "Why a WAV-file input path" above) -- only the mic capture
   mechanics and the no-speech timeout path were exercised live. Worth a manual sanity

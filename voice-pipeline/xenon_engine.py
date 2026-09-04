@@ -73,7 +73,7 @@ def _configure_signatures(lib: ctypes.CDLL) -> None:
 
     lib.xenon_generate.argtypes = [
         ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_float, ctypes.c_float,
-        XENON_TOKEN_CALLBACK, ctypes.c_void_p,
+        ctypes.c_float, XENON_TOKEN_CALLBACK, ctypes.c_void_p,
     ]
     lib.xenon_generate.restype = ctypes.c_int
 
@@ -161,6 +161,7 @@ class XenonEngine:
         max_tokens: int = 80,
         temperature: float = 0.8,
         top_p: float = 0.5,
+        repeat_penalty: float = 1.3,  # matches app/src-tauri/src/inference.rs's tuned value
         on_partial: Optional[Callable[[str], None]] = None,
     ) -> GenerateResult:
         """Streams a response to user_message via the same generate() entry point typed
@@ -195,7 +196,8 @@ class XenonEngine:
         cb = XENON_TOKEN_CALLBACK(_cb)
         t_call_start = time.perf_counter()
         status = self.lib.xenon_generate(
-            self._engine, prompt.encode("utf-8"), max_tokens, temperature, top_p, cb, None
+            self._engine, prompt.encode("utf-8"), max_tokens, temperature, top_p,
+            repeat_penalty, cb, None
         )
         t_call_end = time.perf_counter()
 

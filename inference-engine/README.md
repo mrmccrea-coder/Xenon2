@@ -137,6 +137,13 @@ Each produces `build-<variant>-app/bin/Release/test_inference.exe` (with `rwkv.d
 
 ## Getting a model
 
+**Note (Phase 7 follow-up, 2026-08-01)**: the desktop app (`app/`) no longer loads the 0.4B model
+described below -- it was upgraded to RWKV-7 World v3 2.9B for reply quality; see
+`app/README.md`'s "Phase 7 follow-up: model upgrade" section for the full story and benchmarks.
+This section is left as-is since it documents Phase 1's own CLI harness / acceptance criteria
+against the original 0.4B model, and the same conversion pipeline (steps 2-3 below) is exactly
+what was reused for the 2.9B upgrade, just pointed at a different source checkpoint.
+
 Phase 1 uses **RWKV-5 World 0.4B** (~430M params), matched with the **World tokenizer** (World
 models use `n_vocab = 65536` and REQUIRE the World tokenizer; Pile/Raven models use the 20B BPE
 tokenizer and `n_vocab = 50277` -- pairing the wrong one silently produces garbage output, so
@@ -221,8 +228,26 @@ folder itself (see the follow-up fix above) -- the default `--vocab` resolves re
 
 Flags: `--model PATH` `--vocab PATH` `--threads N` (default 6) `--gpu-layers N` (default 0 =
 CPU-only) `--max-tokens N` (default 100) `--temperature F` (default 0.8) `--top-p F` (default
-0.5) `--measure-memory` (print periodic working-set samples to stderr) `--no-stop` (disable the
-harness's own `\n\nUser:` stop-sequence heuristic, useful for long benchmark/memory runs).
+0.5) `--repeat-penalty F` (default 1.3, matches `app/`'s tuned value -- see "Repetition penalty"
+below; 1.0 disables it) `--measure-memory` (print periodic working-set samples to stderr)
+`--no-stop` (disable the harness's own `\n\nUser:` stop-sequence heuristic, useful for long
+benchmark/memory runs).
+
+### Repetition penalty (Phase 7 follow-up, 2026-08-02)
+
+`xenon_generate` originally had no repetition penalty at all -- just temperature + top-p. Real
+usage of the desktop app showed a real failure mode this caused: since the app resends the full
+conversation history as text on every call (no incremental RWKV state across calls), once the
+model produced a canned phrase once, that phrase became part of every later prompt and the model
+started imitating it for unrelated questions instead of answering them. Added a standard
+llama.cpp-style penalty (`sample_logits` in `xenon_inference.cpp`) applied to any token seen in the
+last 256 tokens of the prompt tail *plus* everything generated so far this call -- deliberately
+covering the prompt tail, not just this call's own output, since the failure mode was echoing
+something from earlier history, not self-repeating within one reply. Empirically tuned by replaying
+the actual failure conversation at different values: 1.0 and 1.15 (llama.cpp's typical low end)
+still fell into the trap; 1.3 (the typical high end) broke it, with no observed quality loss on
+normal exchanges. See `app/README.md`'s "Repetition-penalty engine fix" section for the full
+before/after evidence.
 
 `--gpu-layers` granularity: rwkv.cpp's C API (`rwkv_init_from_file(path, n_threads,
 n_gpu_layers)`) takes a real per-layer offload count, the same granularity as llama.cpp -- this

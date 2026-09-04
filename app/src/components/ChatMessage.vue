@@ -6,9 +6,10 @@
 // App.vue/the Pinia store handle the truncate + re-generate flow. Regenerate just emits
 // `regenerate` and the store replaces that one message's content in place.
 //
-// Delete remains an intentional stub -- see prompts/phase4_prompt.md's explicit scope note: it's
-// a real gap in PLAN.md's Phase 4 task list, not something this phase silently fixes. Do not wire
-// up real delete logic here.
+// Phase 7: delete is now real too (see stores/chat.ts's deleteMessage). Deleting a user message
+// also removes its immediately-following assistant reply, if any -- a user turn and its reply are
+// treated as one deletable unit rather than leaving an orphaned reply with no prompt above it.
+// Confirmed via a native confirm() before emitting, since this is destructive and there's no undo.
 
 import { ref } from "vue";
 import type { ChatMessage } from "../types";
@@ -23,6 +24,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: "edit", newText: string): void;
   (e: "regenerate"): void;
+  (e: "delete"): void;
 }>();
 
 const isEditing = ref(false);
@@ -61,12 +63,14 @@ function onRegenerate() {
   emit("regenerate");
 }
 
-function stubDelete() {
-  console.log(
-    `[ChatMessage] Delete clicked for message ${props.message.id} -- stub only. Real deletion ` +
-      `logic has no owning phase yet (see PLAN.md/phase4_prompt.md's explicit scope note); ` +
-      `Phase 4 intentionally left this un-wired.`
-  );
+function onDelete() {
+  if (props.disabled) return;
+  const msg =
+    "Delete this message" +
+    (props.message.role === "user" ? " and its reply" : "") +
+    "? This can't be undone.";
+  if (!window.confirm(msg)) return;
+  emit("delete");
 }
 </script>
 
@@ -92,14 +96,34 @@ function stubDelete() {
           {{ message.content }}<span v-if="message.streaming" class="cursor">▍</span>
         </div>
         <div v-if="message.edited" class="edited-tag">(edited)</div>
+        <div v-if="message.agent === 'sloth'" class="agent-badge sloth">Sloth</div>
 
         <div class="icons">
           <template v-if="message.role === 'user'">
             <button class="icon-btn" title="Edit" @click="startEdit">✎</button>
-            <button class="icon-btn" title="Delete (stub)" @click="stubDelete">🗑</button>
+            <button class="icon-btn" title="Delete" @click="onDelete">
+              <!-- Inline SVG -- 🗑 was found to render as a garbled fallback glyph in this
+                   environment's WebView2 (missing color-emoji font support). -->
+              <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="3 6 5 6 21 6" />
+                <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                <line x1="10" y1="11" x2="10" y2="17" />
+                <line x1="14" y1="11" x2="14" y2="17" />
+              </svg>
+            </button>
           </template>
           <template v-else>
             <button class="icon-btn" title="Regenerate" @click="onRegenerate">⟳</button>
+            <button class="icon-btn" title="Delete" @click="onDelete">
+              <!-- Inline SVG -- 🗑 was found to render as a garbled fallback glyph in this
+                   environment's WebView2 (missing color-emoji font support). -->
+              <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="3 6 5 6 21 6" />
+                <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                <line x1="10" y1="11" x2="10" y2="17" />
+                <line x1="14" y1="11" x2="14" y2="17" />
+              </svg>
+            </button>
           </template>
         </div>
       </template>
@@ -171,6 +195,19 @@ function stubDelete() {
   font-size: 0.7rem;
   opacity: 0.7;
   font-style: italic;
+}
+
+.agent-badge {
+  display: inline-block;
+  margin-top: 0.3rem;
+  font-size: 0.65rem;
+  padding: 0.1rem 0.4rem;
+  border-radius: 4px;
+}
+
+.agent-badge.sloth {
+  background: #3a3a6b;
+  color: #cfcfff;
 }
 
 .edit-box {
@@ -249,6 +286,9 @@ function stubDelete() {
   font-size: 0.75rem;
   cursor: pointer;
   line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .icon-btn:hover {

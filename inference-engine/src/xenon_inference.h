@@ -79,6 +79,14 @@ XENON_API void xenon_reset_state(xenon_engine * engine);
 // as it is produced (not batched). Stops after `max_tokens` tokens, when the callback returns
 // false, or when the model emits its end-of-text token (id 0).
 // - temperature / top_p: standard sampling parameters (temperature 0 = greedy/argmax).
+// - repeat_penalty: discourages resampling tokens that recently appeared in the prompt's tail
+//   (up to the last 256 prompt tokens) or earlier in this same generation, by dividing/scaling
+//   their logits before sampling (the standard llama.cpp-style repetition penalty). 1.0 = no
+//   penalty (identical to the old behavior); values around 1.1-1.3 are the usual useful range.
+//   Added after real usage showed this small model imitating a canned phrase that was still
+//   sitting in the conversation history from an earlier turn -- with no penalty at all, once a
+//   phrase like "I'm sorry, I can't access my memories" entered the resent history, the model
+//   would keep reproducing it for unrelated follow-up questions.
 // Returns XENON_OK on success (including early stop via callback), otherwise an error code.
 XENON_API xenon_status xenon_generate(
     xenon_engine * engine,
@@ -86,6 +94,7 @@ XENON_API xenon_status xenon_generate(
     int max_tokens,
     float temperature,
     float top_p,
+    float repeat_penalty,
     xenon_token_callback callback,
     void * user_data
 );

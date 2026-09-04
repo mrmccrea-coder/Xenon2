@@ -25,6 +25,13 @@ export interface ChatMessage {
    * Regenerating an assistant message's content does update this, since regeneration produces an
    * effectively new reply at a new point in time. */
   timestamp: number;
+  /** Which agent generated this assistant reply -- "dementia" (default: no memory outside this
+   * chat, exactly the pre-existing behavior) or "sloth" (reads/writes the persistent
+   * cross-conversation fact store, see stores/chat.ts's slothFacts). Set on assistant messages
+   * only; undefined on user messages and on any message created before this feature existed.
+   * The active agent is a mid-conversation toggle (store.activeAgent), not a per-conversation
+   * setting, so a single conversation can contain a mix of both. */
+  agent?: "dementia" | "sloth";
 }
 
 export interface Conversation {

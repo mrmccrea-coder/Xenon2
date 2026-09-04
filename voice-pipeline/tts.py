@@ -19,8 +19,8 @@ import numpy as np
 
 from piper import PiperVoice
 
-DEFAULT_VOICE_MODEL = "models/en_US-lessac-medium.onnx"
-DEFAULT_VOICE_CONFIG = "models/en_US-lessac-medium.onnx.json"
+DEFAULT_VOICE_MODEL = "models/en_GB-alan-medium.onnx"
+DEFAULT_VOICE_CONFIG = "models/en_GB-alan-medium.onnx.json"
 
 
 @dataclass

@@ -44,6 +44,7 @@ extern "C" {
         max_tokens: c_int,
         temperature: f32,
         top_p: f32,
+        repeat_penalty: f32,
         callback: XenonTokenCallback,
         user_data: *mut c_void,
     ) -> XenonStatus;

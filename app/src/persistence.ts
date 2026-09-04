@@ -20,6 +20,7 @@ export interface ConversationFileMessage {
   content: string;
   timestamp: number;
   edited?: boolean;
+  agent?: "dementia" | "sloth";
 }
 
 export interface ConversationFile {
@@ -58,6 +59,7 @@ export function toConversationFile(convo: Conversation, fallbackModel: string): 
         timestamp: m.timestamp,
       };
       if (m.edited) out.edited = true;
+      if (m.agent) out.agent = m.agent;
       return out;
     }),
   };
@@ -79,6 +81,7 @@ export function fromConversationFile(file: ConversationFile): Conversation {
         content: m.content,
         timestamp: m.timestamp,
         edited: m.edited,
+        agent: m.agent,
       })
     ),
   };

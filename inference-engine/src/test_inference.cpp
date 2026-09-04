@@ -68,6 +68,7 @@ struct Args {
     int max_tokens = 100;
     float temperature = 0.8f;
     float top_p = 0.5f;
+    float repeat_penalty = 1.3f; // matches app/src-tauri/src/inference.rs's tuned value
     bool measure_memory = false;
     bool no_stop = false;
     bool has_prompt = false;
@@ -92,6 +93,7 @@ bool parse_args(int argc, char ** argv, Args & out) {
         else if (a == "--max-tokens") out.max_tokens = std::stoi(next("--max-tokens"));
         else if (a == "--temperature") out.temperature = std::stof(next("--temperature"));
         else if (a == "--top-p") out.top_p = std::stof(next("--top-p"));
+        else if (a == "--repeat-penalty") out.repeat_penalty = std::stof(next("--repeat-penalty"));
         else if (a == "--measure-memory") out.measure_memory = true;
         else if (a == "--no-stop") out.no_stop = true;
         else if (!out.has_prompt) { out.prompt = a; out.has_prompt = true; }
@@ -169,7 +171,8 @@ int main(int argc, char ** argv) {
     if (!parse_args(argc, argv, args)) {
         fprintf(stderr,
             "Usage: %s \"<prompt>\" [--model PATH] [--vocab PATH] [--threads N] "
-            "[--gpu-layers N] [--max-tokens N] [--temperature F] [--top-p F] [--measure-memory] [--no-stop]\n",
+            "[--gpu-layers N] [--max-tokens N] [--temperature F] [--top-p F] [--repeat-penalty F] "
+            "[--measure-memory] [--no-stop]\n",
             argc > 0 ? argv[0] : "test_inference");
         return 1;
     }
@@ -224,7 +227,8 @@ int main(int argc, char ** argv) {
     fflush(stdout);
 
     xenon_status status = xenon_generate(
-        engine, full_prompt.c_str(), args.max_tokens, args.temperature, args.top_p, on_token, &st
+        engine, full_prompt.c_str(), args.max_tokens, args.temperature, args.top_p,
+        args.repeat_penalty, on_token, &st
     );
 
     auto gen_end = std::chrono::steady_clock::now();

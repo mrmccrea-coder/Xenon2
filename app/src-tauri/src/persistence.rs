@@ -42,6 +42,10 @@ pub struct ConversationFileMessage {
     pub timestamp: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edited: Option<bool>,
+    /// Which agent generated this message ("dementia" | "sloth") -- see sloth_memory.rs. Absent
+    /// on user messages and on any message saved before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
 }
 
 /// The full on-disk shape of one saved conversation. Mirrors `SCHEMA.md` field-for-field.
@@ -52,8 +56,9 @@ pub struct ConversationFile {
     pub id: String,
     pub title: String,
     /// Name/version of the model that generated this conversation's replies, e.g.
-    /// `"rwkv-5-world-0.4B-Q4_0"`. Recorded faithfully but not validated against the currently
-    /// loaded model this phase -- see phase5_prompt.md task 5.
+    /// `"rwkv-7-world-2.9B-Q5_1"`. Recorded faithfully; compared against the currently loaded
+    /// model on open since Phase 7 (frontend-side, see `stores/chat.ts`'s `modelMismatchWarning`)
+    /// -- a mismatch surfaces a dismissable warning rather than being silently ignored.
     pub model: String,
     pub created_at: i64,
     pub saved_at: i64,

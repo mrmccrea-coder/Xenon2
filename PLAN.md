@@ -187,6 +187,101 @@ Tasks:
 
 ---
 
+## Phase 7 — Hardening & Verification Follow-Through [x] (task 5 needs a human at the mic, see note)
+
+**Depends on**: Phase 6 (all 6 original phases complete)
+
+**Goal**: close specific gaps a project review surfaced after Phase 6 (see
+`prompts/phase7_prompt.md`) -- not new user-facing scope, a follow-up pass.
+
+Tasks:
+1. Wire the mic button (`MessageInput.vue`) to Phase 2's standalone voice
+   pipeline via a long-lived `ipc_server.py` sidecar process
+   (`voice-pipeline/ipc_server.py`), bridged into Tauri by
+   `app/src-tauri/src/voice.rs`. A transcript feeds into the exact same
+   `sendMessage` path typed text uses; the assistant's reply is spoken back
+   via the sidecar's `IncrementalSpeaker` (Phase 2's sentence-chunked
+   streaming TTS), fed fragment-by-fragment from the existing `token-stream`
+   event handler.
+2. Implement real delete-message (`useChatStore().deleteMessage`) -- a real
+   gap Phase 4 explicitly left unowned. Deleting a user message also removes
+   its paired assistant reply; deleting an assistant message removes just
+   that message.
+3. Warn (dismissable banner, non-blocking) when an opened/active
+   conversation's recorded `model` differs from the currently loaded model.
+4. Full GUI click-through (real clicks, not just IPC-level calls) of Export
+   Memory / Import Memory / Data Directory Settings, using the same UI
+   Automation approach Phases 3-5 used.
+5. Live human speech test through the real mic, once available.
+6. Clean up stray git state (uncommitted prompt doc fix, submodule dirty
+   state from untracked build dirs).
+7. Replace the default Tauri icon with the project's alien/UFO icon.
+
+**Acceptance criteria**: see `prompts/phase7_prompt.md`'s "Acceptance
+criteria" section -- all verified against the real running dev build, not
+just code review (see `app/README.md`'s Phase 7 section for specifics).
+
+**Task 5 status**: verified live by the user speaking into the real mic --
+confirmed working.
+
+## Phase 7 follow-up — Model upgrade + Dementia/Sloth memory (2026-08-01)
+
+After Phase 7's original 7 tasks shipped, real usage surfaced two further
+issues, addressed in the same phase rather than opening a new one:
+
+1. **Model quality**: RWKV-5 World 0.4B (Phase 1's original choice) was
+   found to collapse onto generic canned replies for short/greeting-style
+   prompts and got basic arithmetic wrong. Upgraded to **RWKV-7 World v3
+   2.9B** (`rwkv-7-world-2.9B-Q5_1.bin`) -- same World tokenizer, same
+   rwkv.cpp conversion pipeline (rwkv.cpp already supports the v7
+   architecture). Still CPU-only (re-benchmarked: GPU offload is now
+   actually faster for this size -- 11.18 vs 8.95 tok/s -- but CPU-only was
+   kept to avoid a hard CUDA-GPU dependency, matching the portable/
+   USB-first goal). See `app/README.md`'s Phase 7 section for full
+   before/after evidence.
+2. **Persistent memory**: added a mid-conversation toggle between two
+   agents -- **Dementia** (the pre-existing behavior: memory only within
+   the current chat, nothing survives outside it) and **Sloth** (reads and
+   writes a persistent cross-conversation fact store, auto-extracted by the
+   model itself after each Sloth turn, injected into every subsequent Sloth
+   prompt regardless of which conversation it's in). New backend module
+   `app/src-tauri/src/sloth_memory.rs`; UI: a Dementia/Sloth toggle in
+   `MessageInput.vue`, a "Sloth" badge on messages that used it
+   (`ChatMessage.vue`), and a "Sloth Memory..." management panel
+   (`App.vue`) to inspect/delete/clear what's been remembered, since
+   automatic extraction from a small model can be wrong.
+
+### Further follow-up (2026-08-02 to 2026-08-04)
+
+Continued real usage surfaced three more issues, fixed in the same phase:
+
+3. **Closing-question habit**: the model ended nearly every reply with "Is
+   there anything else I can help you with?" -- root-caused to the seed
+   prompt's own example turn ending the same way (the model imitates the
+   literal style of its example, not just the instruction around it). Fixed
+   by rewriting the seed example to close declaratively, plus a display-time
+   backstop that strips any that still slip through.
+4. **Repetition collapse**: `xenon_inference.cpp` had no repetition penalty
+   at all -- once a canned phrase entered the resent conversation history,
+   the model would imitate it for unrelated follow-up questions instead of
+   answering them. Added a standard llama.cpp-style penalty, empirically
+   tuned against the actual failure conversation (1.15 wasn't enough; 1.3
+   broke it with no quality loss on normal exchanges) -- see
+   `inference-engine/README.md`'s "Repetition penalty" section.
+5. **No real clock**: "what time is it" was pure hallucination. Fixed by
+   grounding every prompt in the real system time (`chrono`), plus a
+   demonstrated example turn (a bare instruction wasn't reliably followed
+   for short phrasings) -- see `app/README.md`'s "Real system clock
+   grounding" section.
+
+Also: a British male Piper voice (`en_GB-alan-medium`) replaced the original
+US female voice per user request, and a real bug was caught in the same
+pass -- Phase 6's export/import (`memory.rs`) still hardcoded the pre-upgrade
+0.4B model filename, so Export Memory had been silently backing up the wrong
+model file since the Phase 7 model upgrade. Fixed.
+
+---
+
 ## Future work (not yet scheduled)
 
 - Mamba backend as an alternative to RWKV, once `mamba.cpp` tooling matures.

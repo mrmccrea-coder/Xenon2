@@ -17,10 +17,12 @@ section) are:
   `<Tauri app-data-dir>/session.json` (or, if the Phase 6 "data directory location" setting is
   configured, `<configured-dir>/conversations/...` instead — see "Data directory location setting"
   below).
-- The quantized model actually loaded at runtime: `models/rwkv-5-world-0.4B-Q4_0.bin` (repo root).
+- The quantized model actually loaded at runtime: `models/rwkv-7-world-2.9B-Q5_1.bin` (repo root;
+  upgraded from the original `rwkv-5-world-0.4B-Q4_0.bin` in a Phase 7 follow-up -- see
+  `app/README.md`'s "Model upgrade" section).
 - The tokenizer vocab required to load it: `inference-engine/data/world_vocab.bin`.
 - The piper TTS voice model used by the standalone voice pipeline:
-  `voice-pipeline/models/en_US-lessac-medium.onnx` + its `.onnx.json` sidecar.
+  `voice-pipeline/models/en_GB-alan-medium.onnx` + its `.onnx.json` sidecar.
 
 This document (and the export/import commands) are built against those real paths.
 
@@ -29,11 +31,11 @@ This document (and the export/import commands) are built against those real path
 ```
 <destination>/xenon2-backup/
   models/
-    rwkv-5-world-0.4B-Q4_0.bin      # the quantized RWKV model actually loaded (~450MB)
+    rwkv-7-world-2.9B-Q5_1.bin       # the quantized RWKV model actually loaded (~2.75GB)
     world_vocab.bin                  # tokenizer vocab, required to load the model above
   voice-models/
-    en_US-lessac-medium.onnx         # piper TTS voice model (~63MB)
-    en_US-lessac-medium.onnx.json    # its required sidecar (piper needs both files)
+    en_GB-alan-medium.onnx         # piper TTS voice model (~63MB)
+    en_GB-alan-medium.onnx.json    # its required sidecar (piper needs both files)
   conversations/
     <conversation-id>.json           # one file per saved conversation, per SCHEMA.md
     session.json                     # last-active conversation + path bookkeeping (see below)

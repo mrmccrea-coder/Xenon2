@@ -1,4 +1,4 @@
-# Xenon2 — Phase 3/4/5: Desktop Shell, Chat UI, Editing, and File Save/Load
+# Xenon2 — Phase 3/4/5/6/7: Desktop Shell, Chat UI, Editing, File Save/Load, Export/Import, Hardening
 
 A Tauri 2 + Vue 3 desktop chat app: sidebar + main chat panel, ChatGPT/Claude-Desktop-style
 layout. Phase 3 (see `../PLAN.md` and `../prompts/phase3_prompt.md`) built the shell, layout, and
@@ -6,8 +6,11 @@ typed-text-in / streamed-text-out wiring against Phase 1's inference engine. Pha
 `../prompts/phase4_prompt.md`) migrated conversation state into a Pinia store and wired up real
 edit-user-message and regenerate-assistant-message flows. Phase 5 (see
 `../prompts/phase5_prompt.md` and `../SCHEMA.md`) made conversations durable: File > Save / Save
-As / Open now do real file I/O, and every completed generation auto-saves to disk. No voice yet —
-that's Phase 2 (already built standalone)'s integration, still pending.
+As / Open now do real file I/O, and every completed generation auto-saves to disk. Phase 6 added
+external memory export/import and a data-directory-location setting. Phase 7 (see
+`../prompts/phase7_prompt.md`) is a hardening/follow-up pass: real mic-button voice input/output,
+real delete-message, a model-mismatch warning, a full GUI click-through of Phase 6's features, and
+the app icon — see "Phase 7" below for details.
 
 ## Running the dev build
 
@@ -44,8 +47,8 @@ confirm nothing silently does real work.
 | Sidebar conversation list (Today/Yesterday/Older grouping, click to load) | **Functional** | Backed by durable storage as of Phase 5 (see below) — the sidebar is rebuilt from disk on every launch, not just held in memory. |
 | **Edit icon on user messages** (`ChatMessage.vue`) | **Functional (Phase 4)** | Turns the bubble into an editable textarea (✓ confirm / ✕ cancel, or Enter/Escape). Confirming truncates the conversation after that message, updates its content, sets `edited: true`, and streams a fresh assistant reply from the edited text. See "Edit and regenerate flows" below. |
 | **Regenerate icon on assistant messages** (`ChatMessage.vue`) | **Functional (Phase 4)** | Re-runs generation using history up to (not including) that message and replaces only that message's content in place, regardless of its position in the conversation. |
-| **Delete icon on user messages** (`ChatMessage.vue`) | **Stub — unowned** | `console.log` only, exactly as Phase 3 left it. Explicitly out of scope for Phase 4 *and* Phase 5 — this is a real gap in `PLAN.md`'s task list, not an oversight. No phase currently owns implementing real delete. |
-| Mic toggle button (`MessageInput.vue`) | **Stub** | Visually toggles on/off (turns red), but captures no audio. Phase 2's STT pipeline (already built standalone under `../voice-pipeline/`) gets wired into this button in a later integration step, not in this phase. |
+| **Delete icon on user and assistant messages** (`ChatMessage.vue`) | **Functional (Phase 7)** | Wired to `useChatStore().deleteMessage`. Deleting a user message also removes its immediately-following assistant reply (a user turn + its reply is treated as one deletable unit); deleting an assistant message removes just that message. Persists via the same `autoSave` path an edit uses. Confirmed with a real message via the running dev build (Chrome DevTools Protocol against `window.__store`): a 2-message conversation went to 0 messages after deleting the user message. |
+| Mic toggle button (`MessageInput.vue`) | **Functional (Phase 7)** | Real VAD-gated mic capture -> STT transcript -> the exact same `sendMessage` path typed text uses; the reply is spoken back via sentence-chunked streaming TTS. See "Phase 7: voice input/output" below. |
 | **File > Open / Save / Save As** | **Functional (Phase 5)** | Real native file dialogs (via `rfd`, called directly), real JSON read/write on disk, real schema validation with clear errors on malformed files. See "Phase 5: file persistence" below. |
 | **File > Export Memory** | **Functional (Phase 6)** | Real folder picker + real copy of the quantized model, vocab, voice model, and all conversations into a portable bundle, with live byte-progress. See "Phase 6: external memory export/import" below. |
 | **File > Import Memory** | **Functional (Phase 6)** | Real folder picker + real copy-in of a previously-exported bundle into this machine's local paths, with live byte-progress. |
@@ -385,3 +388,301 @@ truncated the other 5 messages and streamed a fresh reply (2 messages remained, 
 shown); a 4-message conversation had its first (non-last) assistant message regenerated, and
 comparing a JSON dump of all four messages before and after confirmed the other three were
 byte-for-byte unchanged while only the targeted message's content changed.
+
+## Phase 7: hardening & voice input/output
+
+Follow-up pass per `../prompts/phase7_prompt.md` -- closes gaps a project review found after
+Phase 6, not new user-facing scope beyond what that prompt calls for.
+
+### Voice input/output (`app/src-tauri/src/voice.rs`, `voice-pipeline/ipc_server.py`)
+
+Phase 2's VAD/STT/TTS pipeline (`voice-pipeline/`) was standalone Python, never reachable from the
+desktop app. Two integrations were possible: port VAD/STT/TTS to Rust bindings, or run Phase 2's
+existing code as a sidecar process. Chosen: **sidecar** -- porting would mean re-verifying
+faster-whisper/piper/silero-vad's GPU/CPU device placement and the CUDA-12-vs-13 DLL workaround
+(see `../voice-pipeline/README.md`) against a different binding layer, for libraries that only ship
+first-class Python packages. The sidecar reuses Phase 2's exact code unchanged, including
+`IncrementalSpeaker`'s sentence-chunked streaming TTS.
+
+- `voice-pipeline/ipc_server.py`: a long-lived process, spawned once at app startup
+  (`voice::spawn_voice_process`, called from `lib.rs`'s `setup`), speaking newline-delimited JSON
+  over stdin/stdout. Loads VAD/STT (`small`, `cuda` -- safe since this app links Phase 1's
+  **CPU-only** RWKV build, so the GPU is otherwise idle) and TTS once at startup (a few seconds,
+  matching Phase 2's measured load times), then serves `listen` (mic capture -> VAD gate -> STT ->
+  transcript) and `speak_start`/`speak_feed`/`speak_finish` (drives an `IncrementalSpeaker`
+  unchanged from Phase 2) commands. Deliberately does **not** call `xenon_generate()` -- Phase 1's
+  RWKV engine is already loaded and owned by `inference.rs`; loading a second copy in Python would
+  waste memory and contend for the same GPU/CPU, and per the phase's explicit requirement, voice
+  transcripts must feed the *same* `sendMessage` path typed text uses, not a parallel one.
+- `app/src-tauri/src/voice.rs`: spawns the sidecar, demultiplexes its stdout (a reader thread
+  routes `speak_done` directly to a `voice-speak-done` Tauri event; everything else to a channel
+  the current command is awaiting), and exposes `voice_ready`, `voice_listen`,
+  `voice_speak_start`/`voice_speak_feed`/`voice_speak_finish` as Tauri commands. A spawn failure
+  (e.g. the venv isn't set up in some checkout) is recorded, not panicked on -- commands then fail
+  fast with a clear message and typed chat keeps working.
+- Frontend: `MessageInput.vue`'s mic button calls `voice_listen` (awaited); on a successful
+  transcript it emits `voice-send`, which `App.vue`'s `onVoiceSend` feeds into
+  `store.sendMessage(text, true)` -- the exact same function typed sends call, just with a
+  `viaVoice` flag. That flag (`store.currentTurnIsVoice`) is read by the *existing*
+  `token-stream`/`generation-done`/`generation-error` listeners (unchanged from Phase 3/4) to also
+  forward text to `voice_speak_feed`/`voice_speak_finish` -- there is no separate voice code path,
+  per the phase's explicit requirement.
+
+**Verified against the real running dev build** (`npm run tauri dev`, driven both via
+`window.__TAURI_INTERNALS__.invoke` over Chrome DevTools Protocol -- the same approach Phase 5/6
+used -- and via real UI Automation clicks):
+- Sidecar starts and loads all three models on real app launch (log: `loading VAD... / loading STT
+  (faster-whisper, small, cuda)... / loading TTS (piper)... / ready`); `voice_ready` correctly
+  returns `false` during that window and `true` after.
+- `voice_speak_start`/`voice_speak_feed`/`voice_speak_finish` invoked directly against the running
+  app produced real, audible piper TTS playback (confirmed both via a standalone sidecar test
+  driving real audio and again through the actual Tauri command).
+- A full voice-flagged turn (`store.sendMessage(text, true)`, mirroring exactly what
+  `onVoiceSend` does) produced a real user message + a real RWKV-streamed reply, with the
+  already-registered `token-stream` listener forwarding to `voice_speak_feed` throughout --
+  confirming the "same code path, flag-gated speaking" wiring, not a parallel implementation.
+- `voice_listen` in a silent room with a short timeout correctly returned
+  `{ok: false, reason: "no_speech_timeout"}` in ~3s without hanging -- the VAD gate's graceful
+  no-speech path (Phase 2) works end-to-end through the real sidecar and real mic device. (One
+  earlier run, executed immediately after a TTS test on the same speakers, returned a hallucinated
+  transcript instead of a timeout -- consistent with Whisper's known tendency to hallucinate short
+  phrases from ambient/residual audio rather than a bug in the VAD gate; not reproducible in a
+  quiet room afterward.)
+- **Not verified**: an actual human speaking a real utterance into the mic and confirming the
+  transcript/reply end-to-end. This dev machine does have a working microphone (confirmed via
+  `sounddevice.query_devices()` -- "Microphone Array (Intel Smart Sound Technology)"), but no
+  automated agent session can produce real spoken audio into it. This is the one part of Task 5
+  that requires a human at the keyboard to actually test.
+
+### Real delete-message
+
+See the stub table above and `stores/chat.ts`'s `deleteMessage` doc comment. Verified against the
+real running dev build via Chrome DevTools Protocol (`window.__store`): sent a real message
+(2 messages: 1 user + 1 real RWKV-streamed reply), called `deleteMessage` on the user message id,
+confirmed the conversation dropped to 0 messages (both the user message and its paired reply were
+removed together, per the chosen semantics).
+
+### Model-mismatch warning
+
+`stores/chat.ts`'s `modelMismatchWarning` getter (frontend-only -- no backend change needed;
+`persistence.rs`'s `open_conversation_file` already records and returns the file's `model` field,
+Phase 5 just never compared it). Non-blocking, dismissable per-conversation (tracked via
+`modelMismatchDismissed`, reset whenever a different conversation becomes active via the new
+`setActive` helper every `activeId`-changing call site now goes through). Verified live: set an
+active conversation's `model` to a fake different value -- banner appeared with the exact expected
+text; dismissed it -- banner disappeared; reset the model back to match the loaded model -- banner
+stayed gone (not just dismissed-and-forgotten).
+
+### Full GUI click-through of Export/Import/Data Directory Settings
+
+Driven via real UI Automation clicks (`InvokePattern`, `PrintWindow` screenshots -- see Phase 4's
+notes above for why), using the existing `XENON2_TEST_*_DIALOG_PATH`-style escape hatches
+(`XENON2_TEST_EXPORT_DEST_PATH`, `XENON2_TEST_IMPORT_SOURCE_PATH`, `XENON2_TEST_DATADIR_PICK_PATH`
+-- `pick_folder_dialog` already took a generic `test_env_var` param per call site, so no Rust
+change was needed) to get past just the OS folder-picker step, with everything else -- clicking
+File, clicking the menu item, the progress modal, the completion toast -- driven and screenshotted
+for real:
+- **File > Export Memory...**: real click through the File menu opened a real progress flow and
+  ended in a real toast reading "Export complete: 8 file(s), 493.9 MB." -- confirmed the files
+  actually landed on disk at the destination (`models/`, `voice-models/`, `conversations/`).
+- **File > Import Memory...**: same click-through against a bundle built from the export above,
+  toast read "Import complete: 7 file(s), 493.9 MB."
+- **File > Data Directory Settings...**: opened via a real click, `Browse...` populated the path
+  input with the (test-override) folder, `Save` closed the modal, and `load_settings` confirmed
+  `dataDir` was actually persisted to the chosen path -- then reset back to `null` (local app-data
+  default) afterward so the dev environment wasn't left pointed at a deleted temp folder.
+
+**A real bug found and fixed during this verification**: the File dropdown closed via `@blur` on
+the trigger button, guarded only by `@mousedown.prevent` on the dropdown -- that guard stops a
+*real mouse click* from shifting focus before its own click lands, but UI Automation's
+`InvokePattern` (used for this very verification, and for any screen reader or accessibility
+client) shifts focus to the target element as part of invoking it, firing blur on the File button
+first and closing the dropdown before the invoked item's own click finished -- so the click
+silently never landed. Fixed by closing on an outside `mousedown` (tracked via a template ref)
+instead of on blur, which has no such race for any input method, and by changing the "File" trigger
+from a plain `<div tabindex="0">` to a real `<button>` (needed for `InvokePattern` support at all,
+and better semantics/accessibility regardless of automation).
+
+### App icon
+
+`app/src-tauri/icons/source-icon.png` (a green alien in a flying-saucer/UFO, provided alongside
+`prompts/phase7_prompt.md`) was already regenerated into the full icon set via the Tauri CLI's
+icon generator before this pass began (`icon.ico`, `icon.icns`, and the PNG sizes under
+`src-tauri/icons/`, plus `android/`/`ios/` variants) -- `tauri.conf.json`'s `bundle.icon` array
+already pointed at the generated files, no update needed. Confirmed the new icon actually renders
+on the live window (not just that the files changed on disk): a `PrintWindow` screenshot of the
+real running dev build shows the alien/UFO icon in the window's title bar, replacing Tauri's
+default.
+
+### Git cleanup
+
+`prompts/phase1_prompt.md`'s modification was a legitimate documented follow-up fix (auto-copying
+`world_vocab.bin` next to `test_inference.exe`), committed with an honest message. The
+`inference-engine/rwkv.cpp` submodule showed as dirty only because of untracked local build output
+directories (`build-cpu/`, `build-cuda/`) inside it, not a pinned-commit change -- fixed by adding
+`ignore = untracked` to that submodule's `.gitmodules` entry, which is the standard fix for
+"submodule has build artifacts, not real changes." Both fixes are committed; this phase's actual
+feature work (voice, delete, model-mismatch, icon) is left uncommitted for review, per the same
+convention Phases 1-6 followed.
+
+## Phase 7 follow-up: model upgrade + Dementia/Sloth persistent memory
+
+Real usage after Phase 7 shipped surfaced two further issues, fixed in the same phase: the
+0.4B model's reply quality, and the lack of any memory that survives outside one chat window.
+
+### Model upgrade: RWKV-5 World 0.4B -> RWKV-7 World v3 2.9B
+
+Real conversations showed the 0.4B model collapsing onto a near-identical canned reply ("I'm
+having trouble with my voice assistant...") for short/greeting-style prompts regardless of what
+was actually asked, and getting basic arithmetic wrong (`Two plus two is three.`) -- reproduced
+independent of the app via Phase 1's own CLI harness, so this was a real model-quality ceiling,
+not an app bug. Root-caused and evidenced in conversation before this fix (see git history around
+2026-08-01 if resuming from an older checkout).
+
+Upgraded to **RWKV-7 ("Goose") World v3, 2.9B params** (`RWKV-x070-World-2.9B-v3-20250211-ctx4096.pth`
+from `BlinkDL/rwkv-7-world` on Hugging Face), quantized to **Q5_1** (`rwkv-7-world-2.9B-Q5_1.bin`,
+2.75GB). Same World tokenizer as before (no tokenizer/vocab changes needed); same rwkv.cpp
+conversion pipeline Phase 1 established (`convert_pytorch_to_ggml.py` then `quantize.py`) --
+rwkv.cpp already supports the v7 architecture (the vendored submodule's pinned commit is in fact a
+v7-conversion fix, `blocks.0.att.v[0,1,2]` tensors).
+
+**Why 2.9B and not bigger**: RWKV-7 tops out at 2.9B officially (no RWKV-7 7B exists yet; a 7B
+option would mean the older, less parameter-efficient v6 architecture and a much heavier
+download/runtime). The RWKV-7 paper reports `RWKV7-World3-2.9B` averaging 71.5% across English
+benchmarks (5.6T training tokens) versus Qwen2.5-3B's 71.4% (18T training tokens) -- a strong
+result for the parameter count, still a base (non-instruction-tuned) model like before.
+
+**Benchmarked before committing to CPU-only** (this dev machine, i7-12850HX / RTX A1000 4GB):
+
+| Mode | Time to first token | Throughput | VRAM |
+|---|---|---|---|
+| CPU-only, 6 threads | 2.0s | **8.95 tok/s** | -- |
+| CPU-only, 12 threads | 2.0s | 7.00 tok/s (thread oversubscription hurts) | -- |
+| GPU-offloaded, 32/32 layers | 2.3s | 11.18 tok/s | 2.1GB (fits alongside the voice pipeline's ~945MB Whisper `small`) |
+
+GPU is ~25% faster now (unlike the 0.4B result, where CPU won) -- Phase 1 predicted this ("A
+larger RWKV model would likely flip this result"), confirmed. **Kept CPU-only anyway**: linking
+the CUDA build would make the app hard-require a CUDA-capable GPU to launch at all, which cuts
+against the project's portable/USB-first goal; a ~25% throughput difference wasn't judged worth
+that tradeoff. `app/src-tauri/src/inference.rs`'s `load_engine` doc comment records this so a
+future revisit doesn't have to re-derive it.
+
+Verified qualitatively via the CLI harness after the swap: `"What is 2 plus 2?"` ->
+`"Two plus two equals four."` (correct); a multi-turn continuation self-generated by the model
+handled `sqrt(8) ≈ 2.8` reasonably. Not perfect (still a small base model, still base-model-typical
+drift into fake follow-up turns), but a real, measurable step up from the 0.4B collapse pattern.
+
+### Real system clock grounding (2026-08-04)
+
+The "what time is it" hallucination from the earlier diagnosis was never fixed by the repetition-
+penalty change -- it's a separate gap (no real clock access at all). Fixed by prepending the real
+system date/time (via the new `chrono` dependency, `chrono::Local::now()`) to the start of every
+prompt, for both agents (this is basic environmental grounding, not memory, so it isn't gated
+behind Sloth).
+
+A bare grounding line alone was **not reliably used** -- tested side by side: a more elaborate
+phrasing ("What is today's date and what time is it right now?") correctly used the real time, but
+the more common short phrasing ("What time is it?") still reverted to a hallucinated guess. Fixed
+by adding a demonstrated example turn for exactly this question, using the real computed time (not
+a fixed fake value, so the example is never factually wrong and there's no risk of the model
+anchoring on a stale or made-up value the way a hardcoded example would). Re-verified across three
+phrasings ("What time is it?", "what's the date today?", "Do you know the time?") -- all three
+correctly reported the real system time to the minute, confirmed against the actual system clock
+each time.
+
+**Still not reliable enough in further real usage**: even with the demonstrated example, the model
+would report a plausible but *imprecise* time (e.g. "8:05 PM" when it was actually 8:10) and
+sometimes drop AM/PM -- a known small-model weakness: precisely reproducing a specific number from
+context isn't guaranteed even when the correct value is sitting right there in the prompt. Since
+time/date has one objectively correct answer, there's no reason to leave it up to a small model's
+approximation once the question can be reliably detected. Replaced prompt-grounding with a
+deterministic path (`try_answer_time_date_deterministically` in `inference.rs`): a simple keyword
+heuristic on the latest user message ("what time", "current time", "what day", "today's date",
+etc.) bypasses `xenon_generate` entirely and emits the exact real time/date directly as a
+`token-stream` event, formatted TTS-friendly (non-padded hour/day, e.g. "8:10 PM" not "08:10", so
+piper doesn't sound out "zero eight ten"). Verified across four phrasings, including a combined
+"what day and what time" question -- all exact, instant (no model latency at all for these), and
+confirmed against the real system clock at query time.
+### Dementia/Sloth: a mid-conversation memory-agent toggle
+
+Per-conversation history (Phase 3 onward) already gave the model "memory" *within* one chat --
+but nothing survived across separate conversations, and there was no way to distinguish "no
+memory wanted" from "forgot to build it." Added a toggle (`MessageInput.vue`, next to the mic
+button) between two named agents, switchable turn-by-turn within an open conversation (not a
+per-conversation setting -- a single chat can mix both):
+
+- **Dementia** (default): exactly the pre-existing behavior. No memory outside the current chat
+  window; that chat's own history still works normally and still saves to disk like any
+  conversation.
+- **Sloth**: additionally reads a persistent, cross-conversation fact store
+  (`<app-data-dir>/sloth_memory.json`, new module `app/src-tauri/src/sloth_memory.rs`) and injects
+  it into every Sloth-mode prompt as a "Known facts about the user" preamble, and after every
+  successful Sloth reply, runs a second small/low-temperature `generate()` call asking the model
+  whether the exchange revealed anything new and durable worth remembering, appending it to the
+  store if so (capped at the 30 most recent facts, oldest dropped first, so the preamble can never
+  alone blow past the model's context window).
+
+Each assistant message records which agent generated it (`ChatMessage.agent`, `"dementia"` |
+`"sloth"`, persisted -- see `SCHEMA.md`); `ChatMessage.vue` shows a small "Sloth" badge on those
+replies (no badge for Dementia, the unmarked default, to avoid clutter). A "File > Sloth
+Memory..." panel (`App.vue`) lists every stored fact with a per-fact delete and a "Forget
+Everything" clear-all.
+
+**A real failure mode found and fixed while verifying this**: the first extraction prompt design
+(a bare "extract a fact or say NONE" instruction) made the small base model *invent* a
+plausible-sounding fact ("named John, loves pizza") from an exchange that revealed nothing --
+confirmed by inspecting `sloth_memory.json` directly and seeing fabricated content next to the one
+real fact. Fixed two ways: (1) rewrote the extraction prompt to be few-shot (one example that
+should extract, one that should say `NONE`) rather than an abstract instruction -- base models
+follow demonstrated patterns far better than instructions, the same lesson the main chat prompt
+already relies on; (2) added a Rust-side safety net (`run_fact_extraction` in `inference.rs`)
+rejecting any "fact" that's just an echo of the assistant's own reply text, a second failure mode
+that surfaced even after the prompt fix. This is why the Sloth Memory panel supports deleting
+individual facts -- extraction from a small model won't be perfect, and the UI needs to make bad
+entries correctable rather than permanent.
+
+### Repetition-penalty engine fix
+
+A deeper cause behind "it doesn't understand me part of the time": every `generate_response` call
+resends the **entire conversation history as text** (there's no incremental RWKV state across
+calls -- see `inference.rs`'s doc comments). Once the model produced a canned phrase like *"I'm
+sorry, I'm not able to access my memories"* one time, that exact sentence became part of every
+subsequent prompt, and the model started imitating its own recent phrase for unrelated follow-up
+questions instead of answering them. `xenon_inference.cpp` had **no repetition penalty at all** --
+just temperature + top-p.
+
+Added one (`app/src-tauri/src/inference.rs` -> `ffi.rs` -> `inference-engine/src/xenon_inference.h`/
+`.cpp`, plus the CLI harness and the Python `xenon_engine.py` ctypes binding, kept in sync): the
+standard llama.cpp-style penalty (divide positive logits / scale up negative ones for any token
+seen recently, before sampling), applied against a window of the **last 256 tokens of the prompt
+tail plus everything generated so far this call** -- deliberately including the prompt tail, not
+just this call's own output, since the actual failure mode was echoing a phrase from *earlier
+conversation history*, not from within a single reply.
+
+**Empirically tuned against the real failure case, not guessed**: replayed the literal prompt from
+the bad conversation (a phrase already repeated 3 times in history) through the CLI harness at
+different penalty values.
+- `1.0` (no penalty) and `1.15` (llama.cpp's typical low end): **still fell into the trap**,
+  repeating the canned phrase a 4th time for "where are you pulling your time from?"
+- `1.3` (llama.cpp's typical high end): broke free, produced a real answer ("My time is based on
+  the current date and time as determined by the system's internal clock...").
+- Re-verified `1.3` causes no quality loss on normal exchanges (correct arithmetic, coherent fun
+  facts, natural greetings) before committing to it as the shipped value.
+
+**Verified end-to-end against the real running app**: replayed the exact 5-message sequence from
+the original bad conversation through the live `generate_response` command. Before the fix, this
+sequence collapsed to the same repeated sentence; after the fix, it produced five distinct,
+contextually-varied replies -- no repetition collapse.
+
+**Verified against the real running dev build** (Chrome DevTools Protocol driving the real Pinia
+store + real `generate_response`/`sloth_memory` Tauri commands, plus a real GUI click-through of
+the toggle and the Memory panel):
+- A Sloth-mode message ("My name is Alex and I love astronomy.") produced a real extracted fact
+  (`"Alex loves astronomy."`), confirmed byte-for-byte in `sloth_memory.json` on disk.
+- **A brand-new, unrelated conversation, in Sloth mode**, asked "What is my name and what do I
+  love?" correctly answered **"Your name is Alex and you love astronomy."** -- real
+  cross-conversation recall, not just in-chat history.
+- The same question in **Dementia mode, in a fresh chat, did not know the name** -- confirming the
+  two agents are actually isolated, not just cosmetically labeled.
+- The Sloth Memory panel, opened via a real File-menu click (not just an `invoke()` call), showed
+  both stored facts with working per-fact delete buttons -- screenshotted via `PrintWindow`.

@@ -10,6 +10,7 @@
 
 import { onMounted, onUnmounted, ref } from "vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
 
 import MenuBar from "./components/MenuBar.vue";
 import Sidebar from "./components/Sidebar.vue";
@@ -99,9 +100,42 @@ async function clearDataDirSetting() {
   settingsOpen.value = false;
 }
 
+// Phase 7 follow-up: Sloth Memory management panel.
+const slothMemoryOpen = ref(false);
+
+async function openSlothMemory() {
+  await store.loadSlothFacts();
+  slothMemoryOpen.value = true;
+}
+
+async function deleteSlothFact(id: string) {
+  await store.deleteSlothFact(id);
+}
+
+async function clearSlothFacts() {
+  if (!window.confirm("Delete everything Sloth remembers? This can't be undone.")) return;
+  await store.clearSlothFacts();
+}
+
 async function sendMessage(text: string) {
   scrollToBottom();
   await store.sendMessage(text);
+  scrollToBottom();
+}
+
+// Phase 7: mic button transcript feeds the exact same sendMessage/store path typed text uses --
+// no parallel voice-only code path, per phase7_prompt.md task 1. `viaVoice=true` marks the reply
+// for spoken playback (see store.currentTurnIsVoice and the token-stream/generation-done/
+// generation-error handlers below, which forward text to the voice sidecar's TTS while it's set).
+async function onVoiceSend(text: string) {
+  scrollToBottom();
+  try {
+    await invoke("voice_speak_start");
+  } catch (err) {
+    console.warn("[App] voice_speak_start failed (continuing without spoken reply):", err);
+  }
+  await store.sendMessage(text, true);
+  store.currentTurnIsVoice = false;
   scrollToBottom();
 }
 
@@ -120,6 +154,12 @@ async function regenerateMessage(messageId: string) {
   scrollToBottom();
 }
 
+async function deleteMessage(messageId: string) {
+  const conversationId = store.activeConversation?.id;
+  if (!conversationId) return;
+  await store.deleteMessage(conversationId, messageId);
+}
+
 let unlistenToken: UnlistenFn | null = null;
 let unlistenDone: UnlistenFn | null = null;
 let unlistenError: UnlistenFn | null = null;
@@ -129,6 +169,7 @@ let unlistenExportError: UnlistenFn | null = null;
 let unlistenImportProgress: UnlistenFn | null = null;
 let unlistenImportDone: UnlistenFn | null = null;
 let unlistenImportError: UnlistenFn | null = null;
+let unlistenSlothFactsUpdated: UnlistenFn | null = null;
 
 type MemoryProgressPayload = {
   file: string;
@@ -169,21 +210,48 @@ onMounted(async () => {
     store.onMemoryError("import", event.payload.message);
   });
 
+  // Phase 7 follow-up: fired after a Sloth turn's fact-extraction step adds something new.
+  unlistenSlothFactsUpdated = await listen<{ id: string; text: string; createdAt: number }[]>(
+    "sloth-facts-updated",
+    (event) => {
+      store.onSlothFactsUpdated(event.payload);
+    }
+  );
+
   unlistenToken = await listen<{ conversationId: string; text: string }>("token-stream", (event) => {
     store.appendToken(event.payload.conversationId, event.payload.text);
+    if (store.currentTurnIsVoice) {
+      invoke("voice_speak_feed", { text: event.payload.text }).catch((err) =>
+        console.warn("[App] voice_speak_feed failed:", err)
+      );
+    }
     scrollToBottom();
   });
 
   unlistenDone = await listen<{ conversationId: string }>("generation-done", (event) => {
     store.completeGeneration(event.payload.conversationId);
+    if (store.currentTurnIsVoice) {
+      invoke("voice_speak_finish").catch((err) => console.warn("[App] voice_speak_finish failed:", err));
+    }
   });
 
   unlistenError = await listen<{ conversationId: string; message: string }>(
     "generation-error",
     (event) => {
       store.failGeneration(event.payload.conversationId, event.payload.message);
+      // Deliberately not calling voice_speak_finish here -- there's nothing meaningful buffered
+      // to speak for a failed generation. The sidecar tears down any left-open speaker itself on
+      // the next speak_start (see ipc_server.py's handle_speak_start), so nothing leaks.
     }
   );
+
+  // Phase 7: poll the voice sidecar's readiness (model loading takes a few seconds -- see
+  // voice-pipeline/README.md's load times) until it reports ready, then stop polling.
+  await store.refreshVoiceReady();
+  const voiceReadyPoll = window.setInterval(async () => {
+    await store.refreshVoiceReady();
+    if (store.voiceReady) window.clearInterval(voiceReadyPoll);
+  }, 1000);
 });
 
 onUnmounted(() => {
@@ -196,6 +264,7 @@ onUnmounted(() => {
   unlistenImportProgress?.();
   unlistenImportDone?.();
   unlistenImportError?.();
+  unlistenSlothFactsUpdated?.();
 });
 </script>
 
@@ -210,6 +279,7 @@ onUnmounted(() => {
       @export-memory="exportMemory"
       @import-memory="importMemory"
       @settings="openSettings"
+      @sloth-memory="openSlothMemory"
     />
 
     <div class="body">
@@ -235,6 +305,7 @@ onUnmounted(() => {
               :disabled="store.generating"
               @edit="(newText) => editMessage(m.id, newText)"
               @regenerate="() => regenerateMessage(m.id)"
+              @delete="() => deleteMessage(m.id)"
             />
           </div>
         </template>
@@ -244,8 +315,17 @@ onUnmounted(() => {
           {{ store.fileError }}
           <button class="dismiss-btn" title="Dismiss" @click="store.fileError = null">✕</button>
         </div>
+        <div v-if="store.modelMismatchWarning" class="error-banner model-mismatch-banner">
+          {{ store.modelMismatchWarning }}
+          <button class="dismiss-btn" title="Dismiss" @click="store.modelMismatchDismissed = true">✕</button>
+        </div>
 
-        <MessageInput :disabled="store.generating" @send="sendMessage" />
+        <MessageInput
+          :disabled="store.generating"
+          :voice-ready="store.voiceReady"
+          @send="sendMessage"
+          @voice-send="onVoiceSend"
+        />
       </main>
     </div>
 
@@ -303,6 +383,35 @@ onUnmounted(() => {
           <button class="modal-btn" @click="clearDataDirSetting">Use Default</button>
           <button class="modal-btn" @click="settingsOpen = false">Cancel</button>
           <button class="modal-btn primary" @click="saveDataDirSetting">Save</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Phase 7 follow-up: Sloth's persistent cross-conversation memory -->
+    <div v-if="slothMemoryOpen" class="modal-backdrop" @click.self="slothMemoryOpen = false">
+      <div class="modal sloth-modal">
+        <h3>Sloth Memory</h3>
+        <p class="modal-hint">
+          Facts Sloth has automatically remembered across conversations, injected into every
+          Sloth-mode reply. Extraction uses the loaded model itself, so it can sometimes be wrong
+          -- delete anything that doesn't belong.
+        </p>
+        <ul v-if="store.slothFacts.length" class="fact-list">
+          <li v-for="fact in store.slothFacts" :key="fact.id" class="fact-item">
+            <span class="fact-text">{{ fact.text }}</span>
+            <button class="dismiss-btn" title="Forget this" @click="deleteSlothFact(fact.id)">✕</button>
+          </li>
+        </ul>
+        <p v-else class="modal-hint">Sloth doesn't remember anything yet.</p>
+        <div class="modal-actions">
+          <button
+            class="modal-btn"
+            :disabled="!store.slothFacts.length"
+            @click="clearSlothFacts"
+          >
+            Forget Everything
+          </button>
+          <button class="modal-btn primary" @click="slothMemoryOpen = false">Close</button>
         </div>
       </div>
     </div>
@@ -370,6 +479,12 @@ onUnmounted(() => {
 
 .error-banner.file-error {
   margin-top: 0.4rem;
+}
+
+.error-banner.model-mismatch-banner {
+  margin-top: 0.4rem;
+  background: #4a3a1a;
+  color: #ffe4b0;
 }
 
 .dismiss-btn {
@@ -458,6 +573,30 @@ onUnmounted(() => {
   color: #eee;
   padding: 0.4rem 0.5rem;
   font-size: 0.85rem;
+}
+
+.fact-list {
+  list-style: none;
+  margin: 0.6rem 0;
+  padding: 0;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.fact-item {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.4rem 0.5rem;
+  border-radius: 6px;
+  background: #1a1a1b;
+  margin-bottom: 0.35rem;
+}
+
+.fact-text {
+  font-size: 0.82rem;
+  line-height: 1.35;
 }
 
 .modal-actions {

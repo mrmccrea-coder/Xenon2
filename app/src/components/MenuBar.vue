@@ -6,8 +6,18 @@
 // just emits, App.vue calls the store. Save / Save As are disabled when there's no active
 // conversation to save. Export Memory remains an intentional visual stub -- its real logic is
 // Phase 6's job, not this phase's.
+//
+// Phase 7 fix: the dropdown used to close via @blur on the "File" trigger button, protected only
+// by @mousedown.prevent on the dropdown container to stop a *real* mouse click from shifting
+// focus (and blurring) before its own click landed. That protection doesn't cover every path that
+// can programmatically focus a dropdown item -- discovered via UI Automation's InvokePattern
+// (used for this app's own automated verification, see app/README.md's Phase 4 notes), which
+// shifts focus to the target element as part of invoking it, firing blur on the "File" button
+// first and unmounting the dropdown (and the very button being invoked) before its click finished
+// -- so the click silently never landed. Closing on an outside click/mousedown instead (tracked
+// via a template ref, not focus-based) doesn't have this race for any input method.
 
-import { ref } from "vue";
+import { ref, onMounted, onUnmounted } from "vue";
 
 const props = defineProps<{
   /** Disables Save / Save As when there's no active conversation. */
@@ -22,9 +32,11 @@ const emit = defineEmits<{
   (e: "export-memory"): void;
   (e: "import-memory"): void;
   (e: "settings"): void;
+  (e: "sloth-memory"): void;
 }>();
 
 const fileMenuOpen = ref(false);
+const menuItemEl = ref<HTMLElement | null>(null);
 
 function toggleFileMenu() {
   fileMenuOpen.value = !fileMenuOpen.value;
@@ -33,6 +45,16 @@ function toggleFileMenu() {
 function closeFileMenu() {
   fileMenuOpen.value = false;
 }
+
+function onDocumentMousedown(e: MouseEvent) {
+  if (!fileMenuOpen.value) return;
+  if (menuItemEl.value && !menuItemEl.value.contains(e.target as Node)) {
+    closeFileMenu();
+  }
+}
+
+onMounted(() => document.addEventListener("mousedown", onDocumentMousedown));
+onUnmounted(() => document.removeEventListener("mousedown", onDocumentMousedown));
 
 function onNew() {
   emit("new");
@@ -70,13 +92,18 @@ function onSettings() {
   emit("settings");
   closeFileMenu();
 }
+
+function onSlothMemory() {
+  emit("sloth-memory");
+  closeFileMenu();
+}
 </script>
 
 <template>
   <div class="menu-bar" @keydown.escape="closeFileMenu">
-    <div class="menu-item" tabindex="0" @click="toggleFileMenu" @blur="closeFileMenu">
-      File
-      <div v-if="fileMenuOpen" class="dropdown" @mousedown.prevent>
+    <div class="menu-item" ref="menuItemEl">
+      <button class="menu-item-btn" @click="toggleFileMenu">File</button>
+      <div v-if="fileMenuOpen" class="dropdown">
         <button class="dropdown-item" @click="onNew">New</button>
         <button class="dropdown-item" @click="onOpen">Open...</button>
         <button
@@ -98,6 +125,7 @@ function onSettings() {
         <button class="dropdown-item" @click="onImportMemory">Import Memory...</button>
         <div class="dropdown-sep"></div>
         <button class="dropdown-item" @click="onSettings">Data Directory Settings...</button>
+        <button class="dropdown-item" @click="onSlothMemory">Sloth Memory...</button>
       </div>
     </div>
   </div>
@@ -116,14 +144,21 @@ function onSettings() {
 
 .menu-item {
   position: relative;
-  padding: 0.4rem 0.75rem;
-  cursor: default;
   -webkit-app-region: no-drag;
-  outline: none;
 }
 
-.menu-item:hover,
-.menu-item:focus {
+.menu-item-btn {
+  padding: 0.4rem 0.75rem;
+  cursor: default;
+  outline: none;
+  background: none;
+  border: none;
+  color: inherit;
+  font: inherit;
+}
+
+.menu-item-btn:hover,
+.menu-item-btn:focus {
   background: rgba(255, 255, 255, 0.08);
 }
 

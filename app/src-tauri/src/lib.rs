@@ -2,6 +2,8 @@ mod ffi;
 mod inference;
 mod memory;
 mod persistence;
+mod sloth_memory;
+mod voice;
 
 use std::path::PathBuf;
 use tauri::Manager;
@@ -29,7 +31,16 @@ pub fn run() {
             // Phase 6: export/import need to find models/, inference-engine/data/, and
             // voice-pipeline/models/ relative to the repo root too, so it's kept as managed state
             // instead of being recomputed from CARGO_MANIFEST_DIR a second time.
-            app.manage(memory::RepoRoot(repo_root));
+            app.manage(memory::RepoRoot(repo_root.clone()));
+
+            // Phase 7: spawn the voice-pipeline sidecar (see voice.rs's module doc). Model
+            // loading happens inside the sidecar process itself (a few seconds for STT/TTS), so
+            // this doesn't block the app's own startup -- voice_ready() lets the frontend poll
+            // for when it's actually usable, and a spawn failure (e.g. voice-pipeline's venv
+            // isn't set up in this checkout) degrades to "voice unavailable" rather than
+            // panicking, since typed chat must keep working regardless.
+            let voice_process = voice::spawn_voice_process(&repo_root, app.handle().clone());
+            app.manage(voice::VoiceState(voice_process));
 
             Ok(())
         })
@@ -49,6 +60,14 @@ pub fn run() {
             memory::pick_folder_dialog,
             memory::export_memory,
             memory::import_memory,
+            sloth_memory::list_sloth_facts,
+            sloth_memory::delete_sloth_fact,
+            sloth_memory::clear_sloth_facts,
+            voice::voice_ready,
+            voice::voice_listen,
+            voice::voice_speak_start,
+            voice::voice_speak_feed,
+            voice::voice_speak_finish,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
