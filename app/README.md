@@ -1,4 +1,4 @@
-# Xenon2 — Phase 3/4/5/6/7/8: Desktop Shell, Chat UI, Editing, File Save/Load, Export/Import, Hardening, Persistent State
+# Xenon2 — Phase 3/4/5/6/7/8/9: Desktop Shell, Chat UI, Editing, File Save/Load, Export/Import, Hardening, Persistent State, Fire-and-Forget Extraction
 
 A Tauri 2 + Vue 3 desktop chat app: sidebar + main chat panel, ChatGPT/Claude-Desktop-style
 layout. Phase 3 (see `../PLAN.md` and `../prompts/phase3_prompt.md`) built the shell, layout, and
@@ -744,3 +744,45 @@ regenerate -- all four pass. Uses greedy decoding (`temperature = 0`) for full d
 needing an RNG-seeding API, and keeps the repeat-penalty enabled (`1.3`, the production value)
 specifically because that's the part most likely to be subtly wrong under incremental prefill (see
 `inference-engine/README.md` for why it isn't).
+
+## Phase 9: Sloth fact-extraction is now fire-and-forget
+
+Found by the same performance audit that led to Phase 8. `generate_blocking` used to run Sloth's
+fact-extraction pass (a second generate call, `run_fact_extraction`) **before** emitting
+`generation-done`, under the *same* engine-mutex lock acquisition the visible reply's own generate
+call had used -- so the user's reply sat "done but not yet announced" for however long extraction
+took, and the *next* turn's `generate_response` call blocked on that same lock until extraction
+finished too. Nothing about the visible reply depends on extraction (it only persists a fact for
+future turns), so none of that delay was earning anything.
+
+**What changed:** `generate_blocking` no longer calls `run_fact_extraction` itself. On a
+successful Sloth turn it emits `generation-done` immediately, then returns a small
+`PendingExtraction { user_text, reply_text }` (two owned `String`s) instead. `generate_response`
+drops its lock guard right after `generate_blocking` returns, and only then -- if a
+`PendingExtraction` came back -- spawns a *second*, independent `spawn_blocking` task that
+acquires the engine lock on its own, whenever it's next free, and runs extraction there.
+Extraction still only ever touches its own one-time `extraction_prefix` state (Phase 8), never a
+conversation's cached state, so it stays correct no matter how much later it actually runs, even
+after the next turn has already started and possibly finished.
+
+Added `debug_timing_log` (gated behind the `XENON_DEBUG_TIMING` env var, same pattern as Phase 8's
+C++-side `XENON_DEBUG_PREFILL_COUNT`) at each lock-acquire/release point, specifically so this
+claim could be measured against the real running app rather than assumed correct from the diff.
+
+**Measured against the real dev build** (a real Sloth-mode message, `XENON_DEBUG_TIMING=1`):
+
+```
+generate_response task started, awaiting lock (main)   t=...102566
+engine lock acquired (main)                             t=...102566
+generation-done emitted                                 t=...127276   <- user sees the reply here
+engine lock released (main)                             t=...127276
+extraction task spawned, waiting for lock                t=...127276
+engine lock acquired (extraction)                        t=...127276
+extraction finished, engine lock released                t=...132748
+```
+
+`generation-done` and the lock release/extraction handoff are effectively simultaneous (same
+millisecond) -- confirming extraction genuinely starts only after the reply is already announced.
+Extraction itself then ran for **5.47 seconds** (132748 - 127276), entirely after the user already
+had their answer. Before this fix, that 5.47s was added directly to the user's visible wait *and*
+to the next turn's queueing delay; after it, both are zero.

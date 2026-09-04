@@ -308,6 +308,30 @@ output at turn 1/5/edit/regenerate), and measured before/after numbers.
 
 ---
 
+## Phase 9 — Fire-and-forget Sloth fact-extraction [x]
+
+Latency phase, not new user-facing scope, closing a second finding from the
+same performance audit as Phase 8. `generate_blocking` used to run Sloth's
+fact-extraction pass (a second, separate generate call) *before* emitting
+`generation-done`, under the same engine-mutex lock the visible reply's own
+generation had used -- delaying the reply the user was already looking at,
+and blocking the *next* turn's lock acquisition too, even though nothing
+about the visible reply depends on extraction.
+
+`generate_blocking` now emits `generation-done` and returns immediately on
+a successful reply, handing back a small `PendingExtraction` (owned
+`user_text`/`reply_text`) instead of running extraction itself.
+`generate_response` drops its lock guard right after, then -- only if
+there's a pending extraction -- spawns a second, independent background
+task that acquires the engine lock on its own, whenever it's next free, and
+runs extraction there. See `app/README.md`'s "Phase 9" section for the
+design and real measured numbers (via a new `XENON_DEBUG_TIMING` env var):
+a Sloth turn's extraction took 5.47s in one real run, entirely after
+`generation-done` had already fired -- time that used to be added directly
+to the user's visible wait.
+
+---
+
 ## Future work (not yet scheduled)
 
 - Mamba backend as an alternative to RWKV, once `mamba.cpp` tooling matures.

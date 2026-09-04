@@ -72,6 +72,17 @@ struct CachedConversation {
     state: XenonStatePtr,
 }
 
+/// Phase 9: a completed Sloth turn's data, handed back from `generate_blocking` instead of being
+/// acted on immediately, so `generate_response` can run `run_fact_extraction` in a background
+/// task *after* releasing the engine lock instead of holding it across a second generate call
+/// the visible reply doesn't depend on. Owned `String`s, not borrows -- this must be able to
+/// outlive `history` and run correctly no matter how much later (and after how many other turns)
+/// it actually executes, see `run_fact_extraction`'s doc comment.
+struct PendingExtraction {
+    user_text: String,
+    reply_text: String,
+}
+
 /// Bound on how many conversations' incremental state is kept alive at once. Each entry is one
 /// `xenon_get_state_len()`-sized buffer (measured at ~20.6 MB for the RWKV-7 2.9B model -- see
 /// `inference-engine/README.md`), so this caps the feature's steady-state memory cost at
@@ -433,17 +444,23 @@ fn build_extraction_suffix(user_text: &str, reply_text: &str) -> String {
 }
 
 /// Runs the Sloth fact-extraction step: a second, small, low-temperature generate call using the
-/// just-completed turn, under the *same* already-held engine lock as the main reply (kept
-/// sequential rather than concurrent -- rwkv.cpp's per-engine state isn't safe for concurrent
-/// eval calls, see `EngineInner`'s doc comment, and this call is short at `max_tokens=40`).
-/// Always starts from a fresh copy of `extraction_prefix` and discards it afterwards -- this
-/// call must never be able to read or write a conversation's cached state in
-/// `EngineInner::conversation_cache` (Phase 8 requirement: extraction is a side channel, not a
-/// second turn of the actual conversation). On success, persists any real fact via
-/// `sloth_memory::append_fact` and emits `sloth-facts-updated` so an open Memory panel (see
-/// App.vue) can refresh live. Never surfaces its own errors as a `generation-error` -- a
-/// failed/garbled extraction just means no new fact gets remembered this turn, which shouldn't
-/// interrupt or error out the visible reply that already completed successfully.
+/// just-completed turn. As of Phase 9 this is called from a background task, on a lock acquired
+/// separately and later than the main reply's -- see `generate_response`'s doc comment for why
+/// (nothing about the visible reply depends on this, so it must not delay `generation-done` or
+/// the next turn's own lock acquisition). Still fully sequential with respect to *other* engine
+/// calls once it does run (rwkv.cpp's per-engine state isn't safe for concurrent eval calls, see
+/// `EngineInner`'s doc comment) -- "fire-and-forget" here means "don't block on it," not
+/// "run it concurrently with other engine access." Always starts from a fresh copy of
+/// `extraction_prefix` and discards it afterwards -- this call must never be able to read or
+/// write a conversation's cached state in `EngineInner::conversation_cache` (a Phase 8
+/// requirement that Phase 9 leans on: extraction closes over its own owned `user_text`/
+/// `reply_text`, not a borrow into `history` or the cache, so it stays correct no matter how much
+/// later it actually runs, even after the next turn has already started). On success, persists
+/// any real fact via `sloth_memory::append_fact` and emits `sloth-facts-updated` so an open
+/// Memory panel (see App.vue) can refresh live. Never surfaces its own errors as a
+/// `generation-error` -- a failed/garbled extraction just means no new fact gets remembered this
+/// turn, which shouldn't interrupt or error out the visible reply that already completed
+/// successfully (which, as of Phase 9, the user has already seen by the time this even starts).
 fn run_fact_extraction(
     engine: *mut ffi::XenonEngine,
     extraction_prefix: &XenonStatePtr,
@@ -554,6 +571,16 @@ fn now_millis() -> i64 {
         .unwrap_or(0)
 }
 
+/// Phase 9 measurement instrumentation: prints a labeled timestamp to stderr when
+/// `XENON_DEBUG_TIMING` is set, so the generation-done/extraction ordering and latency claims
+/// this phase makes can be measured directly against the real dev build instead of assumed. Off
+/// by default -- `var_os` is only called once per log point, not in any hot loop.
+fn debug_timing_log(label: &str) {
+    if std::env::var_os("XENON_DEBUG_TIMING").is_some() {
+        eprintln!("[timing] {} t={}", label, now_millis());
+    }
+}
+
 /// Feeds `text` into `state` via `xenon_prefill`, mapping the C error into a `Result` instead of
 /// silently ignoring it. `text` == "" is a cheap no-op (see `xenon_prefill`'s doc comment).
 fn prefill_text(engine: *mut ffi::XenonEngine, state: *mut ffi::XenonState, text: &str) -> Result<(), String> {
@@ -639,16 +666,19 @@ fn ensure_cache_extended(
 /// tokens stream in. Meant to be called from inside `spawn_blocking` by the IPC command below,
 /// never directly on the async/event-loop thread. Takes the already-locked `EngineInner` so the
 /// mutex stays held for the full duration of the call (see `EngineInner` doc comment). `agent`
-/// ("dementia" | "sloth") controls whether Sloth's persistent facts are injected into the prompt
-/// and whether a fact-extraction pass runs after a successful reply -- Dementia leaves both
-/// skipped, matching the app's pre-Sloth behavior exactly.
+/// ("dementia" | "sloth") controls whether Sloth's persistent facts are injected into the prompt.
+/// Returns `Some(PendingExtraction)` when a Sloth turn completed successfully and fact-extraction
+/// should run -- as of Phase 9, this function no longer runs that extraction itself (see
+/// `generate_response`'s doc comment for why: nothing about the visible reply depends on it, so
+/// it must not delay `generation-done`, which this function always emits itself before
+/// returning, on every path).
 fn generate_blocking(
     inner: &mut EngineInner,
     app: AppHandle,
     conversation_id: String,
     history: Vec<ChatTurn>,
     agent: String,
-) {
+) -> Option<PendingExtraction> {
     let engine = inner.engine.0;
 
     // `prior_turns` is everything already-happened; the newest user turn is what this call
@@ -662,7 +692,7 @@ fn generate_blocking(
                 "generation-error",
                 GenerationErrorEvent { conversation_id, message: "generate_response called with empty history".to_string() },
             );
-            return;
+            return None;
         }
     };
 
@@ -670,7 +700,7 @@ fn generate_blocking(
         Ok(s) => s,
         Err(message) => {
             let _ = app.emit("generation-error", GenerationErrorEvent { conversation_id, message });
-            return;
+            return None;
         }
     };
 
@@ -680,7 +710,7 @@ fn generate_blocking(
             TokenEvent { conversation_id: conversation_id.clone(), text: answer },
         );
         let _ = app.emit("generation-done", GenerationDoneEvent { conversation_id });
-        return;
+        return None;
     }
 
     let is_sloth = agent == "sloth";
@@ -713,7 +743,7 @@ fn generate_blocking(
                     message: format!("prompt contained an embedded NUL byte: {e}"),
                 },
             );
-            return;
+            return None;
         }
     };
 
@@ -751,11 +781,22 @@ fn generate_blocking(
     unsafe { ffi::xenon_state_free(turn_state) };
 
     if status == ffi::XenonStatus::OK {
-        if is_sloth {
-            let reply_text = ctx.full_text.borrow();
-            run_fact_extraction(engine, &inner.extraction_prefix, &app, &new_user_turn.content, &reply_text);
-        }
+        // Phase 9: emit generation-done FIRST -- the user sees the reply now, full stop. Building
+        // a PendingExtraction (just cloning two owned Strings) and handing it back to the caller
+        // is essentially free; the expensive part (the actual second generate call) happens in
+        // `generate_response`'s background task, after this function has already returned and
+        // its caller has released the engine lock.
+        let pending = if is_sloth {
+            Some(PendingExtraction {
+                user_text: new_user_turn.content.clone(),
+                reply_text: ctx.full_text.borrow().clone(),
+            })
+        } else {
+            None
+        };
+        debug_timing_log("generation-done emitted");
         let _ = app.emit("generation-done", GenerationDoneEvent { conversation_id });
+        pending
     } else {
         let _ = app.emit(
             "generation-error",
@@ -764,12 +805,21 @@ fn generate_blocking(
                 message: last_error(),
             },
         );
+        None
     }
 }
 
 /// Tauri IPC command: frontend sends the full turn history (ending with the new user message)
 /// plus which agent this turn should use, backend streams the assistant's reply back via
 /// `token-stream` / `generation-done` / `generation-error` events tagged with `conversation_id`.
+///
+/// Phase 9: Sloth fact-extraction no longer runs under the same lock acquisition as the visible
+/// reply. `generate_blocking` emits `generation-done` and returns as soon as the reply is ready;
+/// only *then* is its lock guard dropped, and if it handed back a `PendingExtraction`, a second,
+/// independent `spawn_blocking` task acquires the engine lock on its own (whenever it's next
+/// free -- possibly after the very next turn, if the user replies fast) and runs extraction
+/// there. Nothing about the visible reply depends on extraction, so it must never be able to
+/// delay `generation-done` or make the *next* turn's `generate_response` call wait on it.
 #[tauri::command]
 pub async fn generate_response(
     app: AppHandle,
@@ -779,16 +829,40 @@ pub async fn generate_response(
     agent: String,
 ) -> Result<(), String> {
     let engine_arc = engine.0.clone();
+    let extraction_app = app.clone();
+    let extraction_engine_arc = engine_arc.clone();
 
     tauri::async_runtime::spawn_blocking(move || {
-        // Held for the entire blocking generate() call (cache lookups/extends, the generate
-        // call itself, and, for Sloth, the extraction call right after it) -- see `EngineInner`'s
-        // doc comment.
+        // Held for the blocking generate() call and the cache lookups/extends around it, but no
+        // longer across a Sloth extraction call too -- see this function's doc comment.
+        debug_timing_log("generate_response task started, awaiting lock (main)");
         let mut guard = match engine_arc.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        generate_blocking(&mut guard, app, conversation_id, history, agent);
+        debug_timing_log("engine lock acquired (main)");
+        let pending = generate_blocking(&mut guard, app, conversation_id, history, agent);
+        drop(guard); // release before scheduling extraction -- this is the actual fix
+        debug_timing_log("engine lock released (main)");
+
+        if let Some(job) = pending {
+            tauri::async_runtime::spawn_blocking(move || {
+                debug_timing_log("extraction task spawned, waiting for lock");
+                let guard = match extraction_engine_arc.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                debug_timing_log("engine lock acquired (extraction)");
+                run_fact_extraction(
+                    guard.engine.0,
+                    &guard.extraction_prefix,
+                    &extraction_app,
+                    &job.user_text,
+                    &job.reply_text,
+                );
+                debug_timing_log("extraction finished, engine lock released");
+            });
+        }
     })
     .await
     .map_err(|e| e.to_string())
