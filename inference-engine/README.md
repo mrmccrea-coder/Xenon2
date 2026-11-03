@@ -513,3 +513,44 @@ cares more about steady-state tok/s than initial latency should leave it at the 
 larger RWKV model (1.5B+) would likely flip this result, since compute cost per kernel launch
 would grow faster than the fixed launch overhead -- untested here, out of scope for Phase 1's
 430M model target.
+
+
+## Backend evaluation: rwkv.cpp vs llama.cpp vs web-rwkv (2026-11-03)
+
+Measured on one machine (i7-12850HX, RTX A1000 4 GB, Intel UHD 770), decode tokens/sec, 3 runs each.
+Models: RWKV7-G1l 1.5B and G1k 2.9B. llama.cpp is official release `b12078` with community GGUFs
+(`shoumenchougou/RWKV7-G1*-GGUF`); web-rwkv is 0.10.20 (`examples/bench`). All downloads were
+SHA-256 verified. Our engine's figures use decode-only timing, `(tokens-1)/(total-time_to_first_token)`;
+earlier README numbers that include prompt time understate GPU speed.
+
+| 1.5B | CPU | NVIDIA GPU | Intel iGPU |
+|---|---|---|---|
+| ours (rwkv.cpp, Q5_1) | 10.8 | 24 (18-28) | unsupported |
+| llama.cpp, Q5_1 (same quant) | 15.5 | 79.7 (Vulkan) | 11.7 (Vulkan) |
+| llama.cpp, Q5_K_M | 17.6 | 88-96 | 13.6 |
+| web-rwkv Int8 (Vulkan) | none | 41 | not tested |
+
+| 2.9B | CPU | NVIDIA GPU | Intel iGPU |
+|---|---|---|---|
+| ours (Q5_1) | 7.5 | 13.7 | unsupported |
+| llama.cpp, Q5_K_M | 9.1 | ~8 (unexplained) | 8.5 |
+
+- llama.cpp is faster at 1.5B (about 1.4x CPU, 3.3x NVIDIA at equal quantization) and its Vulkan
+  build also covers AMD and Intel GPUs. At 2.9B on the 4 GB NVIDIA card it drops to ~8 tok/s
+  (96 at 1.5B); the cause is undiagnosed and must be resolved before relying on it.
+- web-rwkv is GPU-only (no CPU path); its 3 GB FP16 run was 5.5 tok/s on this card.
+- Not checked: output quality of the GGUF quantizations, AMD/Apple hardware, the GPU path of the
+  state test below, 2.9B state test.
+
+**State continuation (Phase 8's property) on llama.cpp**, via `llama-server` slot save/restore on
+CPU with the 1.5B model: restoring the saved state (about 26 MB) and continuing is byte-identical to
+a full re-read at temperature 0 in all four scenarios (turn 1, turn 5, edited earlier turn,
+regenerate), with and without a 1.3 repeat penalty, **only with `-b 16 -ub 16`**. With default
+batching, turn 1 flips one near-tied token (0.477 vs 0.436) because the prompt is split into
+different batches; the state is not corrupted. An edited history correctly falls back to a full
+re-read. llama.cpp's command-line `--prompt-cache` is unusable for this: it stores token lists only
+and never evaluates the prompt when priming. Verify reuse through the server's `timings.prompt_n`.
+
+Recommendation: do not replace rwkv.cpp yet. Next steps, in order: diagnose the 2.9B Vulkan
+slowdown; if it holds up, put llama.cpp behind `xenon_inference.h` with fixed 16-token batching and
+rerun `test_state_cache` against it. That change touches the engine build files.
