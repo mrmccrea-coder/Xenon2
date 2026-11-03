@@ -94,6 +94,14 @@ interface ChatState {
    * decide whether to also forward text to the voice sidecar's TTS via `voice_speak_feed`/
    * `voice_speak_finish`. Typed replies are never spoken aloud. */
   currentTurnIsVoice: boolean;
+  /** True from `voice_speak_start` until the sidecar's `voice-speak-done` event fires, i.e.
+   * while a spoken reply is actually queued or playing through the speakers. The mic button
+   * (`MessageInput.vue`) stays disabled for this whole window -- opening the mic while the
+   * app's own TTS is still audible is exactly the feedback loop that made faster-whisper
+   * hallucinate a transcript from residual playback (see `voice-pipeline/ipc_server.py`'s
+   * `_wait_out_speaker_feedback`, which backstops this with a cooldown even if the UI's own
+   * gating here were somehow bypassed). */
+  speaking: boolean;
 
   // --- Phase 7 follow-up: Dementia/Sloth agent toggle + Sloth's persistent memory ---
   /** Which agent the *next* generation call uses. A mid-conversation toggle (see
@@ -106,6 +114,20 @@ interface ChatState {
    * demand when that panel opens and refreshed live via the `sloth-facts-updated` event fired
    * after every Sloth turn's fact-extraction step. */
   slothFacts: SlothFact[];
+
+  // --- Model selector ---
+  models: ModelOption[];
+  /** True while a model hot-swap is loading; the UI disables chat input for the duration. */
+  switchingModel: boolean;
+}
+
+export interface ModelOption {
+  id: string;
+  label: string;
+  blurb: string;
+  installed: boolean;
+  fileName: string | null;
+  active: boolean;
 }
 
 export interface SlothFact {
@@ -142,8 +164,11 @@ export const useChatStore = defineStore("chat", {
     dataDir: null,
     voiceReady: false,
     currentTurnIsVoice: false,
+    speaking: false,
     activeAgent: "dementia",
     slothFacts: [],
+    models: [],
+    switchingModel: false,
   }),
 
   getters: {
@@ -214,6 +239,31 @@ export const useChatStore = defineStore("chat", {
         this.deviceLabel = await invoke<string>("get_inference_device");
       } catch (err) {
         console.warn("[chat store] could not fetch inference device:", err);
+      }
+    },
+
+    async refreshModels(): Promise<void> {
+      try {
+        this.models = await invoke<ModelOption[]>("list_models");
+      } catch (err) {
+        console.warn("[chat store] could not list models:", err);
+      }
+    },
+
+    /** Hot-swaps the backend model to the given tier. On failure the old model keeps running and
+     * the reason is surfaced via `backendError`. */
+    async switchModel(tierId: string): Promise<void> {
+      if (this.generating || this.switchingModel) return;
+      this.switchingModel = true;
+      this.backendError = null;
+      try {
+        this.modelName = await invoke<string>("switch_model", { tierId });
+        this.deviceLabel = await invoke<string>("get_inference_device");
+      } catch (err) {
+        this.backendError = `Could not switch model: ${err}`;
+      } finally {
+        this.switchingModel = false;
+        await this.refreshModels();
       }
     },
 

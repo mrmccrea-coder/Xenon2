@@ -11,11 +11,13 @@
 import { onMounted, onUnmounted, ref } from "vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import MenuBar from "./components/MenuBar.vue";
 import Sidebar from "./components/Sidebar.vue";
 import ChatMessageVue from "./components/ChatMessage.vue";
 import MessageInput from "./components/MessageInput.vue";
+import ModelPicker from "./components/ModelPicker.vue";
 import { useChatStore } from "./stores/chat";
 
 const store = useChatStore();
@@ -30,6 +32,19 @@ function applyViewport() {
   if (isNarrow && !wasNarrow) sidebarOpen.value = false;
   wasNarrow = isNarrow;
   narrow.value = isNarrow;
+}
+
+// Chat content (messages + input bar) is capped to a comfortable reading width by default,
+// same idea as ChatGPT/Claude Desktop -- a 1200px-wide window stretched edge to edge makes
+// long replies hard to read. It's allowed to use the full window width only once the window
+// is actually maximized or fullscreened, where the extra horizontal space is deliberate.
+const isWide = ref(false);
+let unlistenWindowResize: UnlistenFn | null = null;
+
+async function refreshIsWide() {
+  const win = getCurrentWindow();
+  const [maximized, fullscreen] = await Promise.all([win.isMaximized(), win.isFullscreen()]);
+  isWide.value = maximized || fullscreen;
 }
 
 function scrollToBottom() {
@@ -141,6 +156,7 @@ async function onVoiceSend(text: string) {
   scrollToBottom();
   try {
     await invoke("voice_speak_start");
+    store.speaking = true;
   } catch (err) {
     console.warn("[App] voice_speak_start failed (continuing without spoken reply):", err);
   }
@@ -180,6 +196,7 @@ let unlistenImportProgress: UnlistenFn | null = null;
 let unlistenImportDone: UnlistenFn | null = null;
 let unlistenImportError: UnlistenFn | null = null;
 let unlistenSlothFactsUpdated: UnlistenFn | null = null;
+let unlistenVoiceSpeakDone: UnlistenFn | null = null;
 
 type MemoryProgressPayload = {
   file: string;
@@ -199,9 +216,15 @@ onMounted(async () => {
   // or loaded afterwards has a real fallback value -- see store.newChat/autoSave), then restore
   // the last session (sidebar + last-active conversation) before wiring up generation events.
   await store.initModelName();
+  await store.refreshModels();
   await store.loadDataDirSetting();
   await store.restoreSession();
   scrollToBottom();
+
+  await refreshIsWide();
+  unlistenWindowResize = await getCurrentWindow().onResized(() => {
+    void refreshIsWide();
+  });
 
   // Phase 6: export/import progress events (see memory.rs's copy_with_progress).
   unlistenExportProgress = await listen<MemoryProgressPayload>("export-progress", (event) => {
@@ -254,9 +277,19 @@ onMounted(async () => {
       store.failGeneration(event.payload.conversationId, event.payload.message);
       // Deliberately not calling voice_speak_finish here -- there's nothing meaningful buffered
       // to speak for a failed generation. The sidecar tears down any left-open speaker itself on
-      // the next speak_start (see ipc_server.py's handle_speak_start), so nothing leaks.
+      // the next speak_start (see ipc_server.py's handle_speak_start), so nothing leaks. No
+      // speak_done event is coming for this turn either, though, so clear `speaking` directly --
+      // otherwise a failed voice turn would leave the mic button disabled forever.
+      store.speaking = false;
     }
   );
+
+  // Fired once the sidecar's IncrementalSpeaker has actually finished playing a reply out loud
+  // (not just once the request was acknowledged -- see voice.rs's doc comment on this event).
+  // Clears `speaking` so the mic button re-enables only once it's actually safe to listen again.
+  unlistenVoiceSpeakDone = await listen("voice-speak-done", () => {
+    store.speaking = false;
+  });
 
   // Phase 7: poll the voice sidecar's readiness (model loading takes a few seconds -- see
   // voice-pipeline/README.md's load times) until it reports ready, then stop polling.
@@ -279,6 +312,8 @@ onUnmounted(() => {
   unlistenImportDone?.();
   unlistenImportError?.();
   unlistenSlothFactsUpdated?.();
+  unlistenVoiceSpeakDone?.();
+  unlistenWindowResize?.();
 });
 </script>
 
@@ -309,41 +344,50 @@ onUnmounted(() => {
       />
 
       <main class="chat-panel">
-        <div v-if="!store.activeConversation" class="empty-state">
-          <p>No conversation selected.</p>
-          <p class="hint">Type a message below, or click "+ New Chat" to get started.</p>
-        </div>
-
-        <template v-else>
-          <div ref="messagesContainer" class="messages">
-            <ChatMessageVue
-              v-for="m in store.activeConversation.messages"
-              :key="m.id"
-              :message="m"
-              :disabled="store.generating"
-              @edit="(newText) => editMessage(m.id, newText)"
-              @regenerate="() => regenerateMessage(m.id)"
-              @delete="() => deleteMessage(m.id)"
-            />
+        <div class="chat-content" :class="{ wide: isWide }">
+          <ModelPicker
+            :models="store.models"
+            :busy="store.generating || store.switchingModel"
+            :loading="store.switchingModel"
+            @select="(id) => store.switchModel(id)"
+          />
+          <div v-if="!store.activeConversation" class="empty-state">
+            <p>No conversation selected.</p>
+            <p class="hint">Type a message below, or click "+ New Chat" to get started.</p>
           </div>
-        </template>
 
-        <div v-if="store.backendError" class="error-banner">{{ store.backendError }}</div>
-        <div v-if="store.fileError" class="error-banner file-error">
-          {{ store.fileError }}
-          <button class="dismiss-btn" title="Dismiss" @click="store.fileError = null">✕</button>
-        </div>
-        <div v-if="store.modelMismatchWarning" class="error-banner model-mismatch-banner">
-          {{ store.modelMismatchWarning }}
-          <button class="dismiss-btn" title="Dismiss" @click="store.modelMismatchDismissed = true">✕</button>
-        </div>
+          <template v-else>
+            <div ref="messagesContainer" class="messages">
+              <ChatMessageVue
+                v-for="m in store.activeConversation.messages"
+                :key="m.id"
+                :message="m"
+                :disabled="store.generating"
+                @edit="(newText) => editMessage(m.id, newText)"
+                @regenerate="() => regenerateMessage(m.id)"
+                @delete="() => deleteMessage(m.id)"
+              />
+            </div>
+          </template>
 
-        <MessageInput
-          :disabled="store.generating"
-          :voice-ready="store.voiceReady"
-          @send="sendMessage"
-          @voice-send="onVoiceSend"
-        />
+          <div v-if="store.backendError" class="error-banner">{{ store.backendError }}</div>
+          <div v-if="store.fileError" class="error-banner file-error">
+            {{ store.fileError }}
+            <button class="dismiss-btn" title="Dismiss" @click="store.fileError = null">✕</button>
+          </div>
+          <div v-if="store.modelMismatchWarning" class="error-banner model-mismatch-banner">
+            {{ store.modelMismatchWarning }}
+            <button class="dismiss-btn" title="Dismiss" @click="store.modelMismatchDismissed = true">✕</button>
+          </div>
+
+          <MessageInput
+            :disabled="store.generating || store.switchingModel"
+            :voice-ready="store.voiceReady"
+            :speaking="store.speaking"
+            @send="sendMessage"
+            @voice-send="onVoiceSend"
+          />
+        </div>
       </main>
     </div>
 
@@ -471,10 +515,29 @@ onUnmounted(() => {
   flex: 1;
   display: flex;
   flex-direction: column;
+  align-items: center;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
   background: #131314;
+}
+
+/* Capped reading width by default (see isWide in script); goes edge-to-edge only once the
+   window is maximized or fullscreened, where the extra width stops being a readability cost
+   and starts being space the user actually asked for. */
+.chat-content {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+  width: 100%;
+  max-width: 760px;
+  transition: max-width 0.15s ease;
+}
+
+.chat-content.wide {
+  max-width: 1100px;
 }
 
 .messages {

@@ -125,52 +125,107 @@ pub struct EngineState(pub Arc<Mutex<EngineInner>>);
 /// `"rwkv-5-world-0.4B-Q4_0"`), recorded so Phase 5's saved conversation files can note which
 /// model generated them (see `persistence::ConversationFile::model`). Computed once from the
 /// actual path `load_engine` loads, so it can never drift from what's really running.
-pub struct ModelInfo(pub String);
+pub struct ModelInfo(pub Mutex<String>);
 
 /// Short label for the menu bar. "CUDA — all layers on GPU" when offload succeeded.
-pub struct DeviceInfo(pub String);
+pub struct DeviceInfo(pub Mutex<String>);
 
 #[tauri::command]
 pub fn get_model_name(model_info: tauri::State<'_, ModelInfo>) -> String {
-    model_info.0.clone()
+    model_info.0.lock().map(|g| g.clone()).unwrap_or_default()
 }
 
 #[tauri::command]
 pub fn get_inference_device(device_info: tauri::State<'_, DeviceInfo>) -> String {
-    device_info.0.clone()
+    device_info.0.lock().map(|g| g.clone()).unwrap_or_default()
 }
 
-/// Loads the Phase 1 model once at app startup. Panics (fails app startup) rather than silently
-/// falling back to a stub -- per the phase spec, this app must call the real inference engine,
-/// not reimplement or fake it. Also returns a `ModelInfo` derived from the same path, so the name
-/// recorded in saved conversation files (Phase 5) can never drift from what's actually loaded.
-pub fn load_engine(repo_root: &PathBuf) -> (EngineState, ModelInfo, DeviceInfo) {
-    // Phase 7 follow-up (model upgrade): swapped from RWKV-5 World 0.4B to RWKV-7 World 2.9B v3
-    // -- the 0.4B base model was found to collapse onto generic canned replies for short/
-    // greeting-style prompts and got basic arithmetic wrong (see conversation history around
-    // 2026-08-01). RWKV-7 ("Goose") is a materially more capable architecture per-parameter --
-    // the paper reports RWKV7-World3-2.9B nearly matching Qwen2.5-3B on English benchmarks
-    // despite far less training data. Same World tokenizer, same rwkv.cpp conversion pipeline,
-    // GPU offload is preferred when this binary was built with CUDA (see build.rs, which links
-    // build-cuda-app ahead of build-cpu-app). An RTX 2060 has 6GB; this Q5_1 file is ~2.75GB
-    // and the RWKV state is ~21MB, so every layer fits. If CUDA init fails, load retries on CPU
-    // so a CUDA build still starts on a machine with no NVIDIA GPU.
-    let model_path = repo_root.join("models").join("rwkv-7-world-2.9B-Q5_1.bin");
-    let vocab_path = repo_root
-        .join("inference-engine")
-        .join("data")
-        .join("world_vocab.bin");
+/// One selectable model tier. `candidates` are filenames under `models/`, tried in order -- the
+/// first one that exists is the tier's model, so a tier can fall back to an older file until its
+/// preferred one has been downloaded/converted.
+struct ModelTier {
+    id: &'static str,
+    label: &'static str,
+    blurb: &'static str,
+    candidates: &'static [&'static str],
+}
 
+const MODEL_TIERS: [ModelTier; 3] = [
+    ModelTier {
+        id: "fast",
+        label: "Fast",
+        blurb: "~0.4B, lowest latency",
+        candidates: &["rwkv7-g1-0.4B-Q5_1.bin", "rwkv-5-world-0.4B-Q4_0.bin"],
+    },
+    ModelTier {
+        id: "balanced",
+        label: "Balanced",
+        blurb: "~1.5B, speed/quality mix",
+        candidates: &["rwkv7-g1-1.5B-Q5_1.bin"],
+    },
+    ModelTier {
+        id: "quality",
+        label: "Quality",
+        blurb: "~2.9B, best replies",
+        candidates: &["rwkv7-g1-2.9B-Q5_1.bin", "rwkv-7-world-2.9B-Q5_1.bin"],
+    },
+];
+
+const DEFAULT_TIER: &str = "quality";
+
+fn tier_by_id(id: &str) -> Option<&'static ModelTier> {
+    MODEL_TIERS.iter().find(|t| t.id == id)
+}
+
+fn tier_model_path(repo_root: &PathBuf, tier: &ModelTier) -> Option<PathBuf> {
+    let dir = repo_root.join("models");
+    tier.candidates.iter().map(|f| dir.join(f)).find(|p| p.exists())
+}
+
+fn vocab_path_for(repo_root: &PathBuf) -> PathBuf {
+    repo_root.join("inference-engine").join("data").join("world_vocab.bin")
+}
+
+fn choice_file(app: &AppHandle) -> Option<PathBuf> {
+    use tauri::Manager;
+    app.path().app_data_dir().ok().map(|d| d.join("model_choice.json"))
+}
+
+/// The tier saved by the last `switch_model`, if any. Kept in its own file (not `Settings`) because
+/// the frontend rewrites the whole settings struct whenever the data directory changes.
+fn saved_tier_id(app: &AppHandle) -> Option<String> {
+    let raw = std::fs::read_to_string(choice_file(app)?).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    v.get("tier")?.as_str().map(|s| s.to_string())
+}
+
+fn save_tier_id(app: &AppHandle, id: &str) -> Result<(), String> {
+    let path = choice_file(app).ok_or("Could not resolve the app data directory")?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("Could not create '{}': {e}", dir.display()))?;
+    }
+    std::fs::write(&path, serde_json::json!({ "tier": id }).to_string())
+        .map_err(|e| format!("Could not write '{}': {e}", path.display()))
+}
+
+/// Loads `model_path`, prefills the two static preambles, and returns the ready-to-use engine
+/// bundle plus the model's name (its filename minus extension). Returns `Err` instead of
+/// panicking so a failed runtime switch leaves the currently loaded model untouched.
+fn build_engine_inner(model_path: &PathBuf, vocab_path: &PathBuf) -> Result<(EngineInner, String, String), String> {
     let model_name = model_path
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "unknown-model".to_string());
 
     let model_path_c = CString::new(model_path.to_string_lossy().as_bytes())
-        .expect("model path contains NUL byte");
+        .map_err(|_| "model path contains NUL byte".to_string())?;
     let vocab_path_c = CString::new(vocab_path.to_string_lossy().as_bytes())
-        .expect("vocab path contains NUL byte");
+        .map_err(|_| "vocab path contains NUL byte".to_string())?;
 
+    // GPU offload is preferred when this binary was built with CUDA (see build.rs, which links
+    // build-cuda-app ahead of build-cpu-app). An RTX 2060 has 6GB; the 2.9B Q5_1 file is ~2.75GB
+    // and the RWKV state is ~21MB, so every layer fits. If CUDA init fails, load retries on CPU
+    // so a CUDA build still starts on a machine with no NVIDIA GPU.
     // 6 threads matches the CLI harness default. rwkv.cpp clamps n_gpu_layers to n_layer+1,
     // so 999 means "every block plus the output head", which is what a 6GB 2060 should do
     // with this model. A CPU-only library ignores the count (no CUDA backend is compiled in).
@@ -199,13 +254,12 @@ pub fn load_engine(repo_root: &PathBuf) -> (EngineState, ModelInfo, DeviceInfo) 
     }
 
     if engine.is_null() {
-        let err = last_error();
-        panic!(
-            "Failed to load Phase 1 model from '{}' (vocab '{}'): {}",
+        return Err(format!(
+            "Failed to load model '{}' (vocab '{}'): {}",
             model_path.display(),
             vocab_path.display(),
-            err
-        );
+            last_error()
+        ));
     }
 
     let device_label = if on_gpu {
@@ -217,45 +271,151 @@ pub fn load_engine(repo_root: &PathBuf) -> (EngineState, ModelInfo, DeviceInfo) 
     };
     eprintln!("xenon2: inference device: {device_label}");
 
-    // Phase 8: prefill the two engine-level static preambles once, up front, instead of
-    // re-evaluating them on every single generate/extraction call -- see `EngineInner`'s doc
-    // comment and `STATIC_PREFIX` / `build_extraction_prompt`'s static half below. A failure
-    // here means the tokenizer/engine can't even process plain text, which would fail every real
-    // generation anyway, so panicking (matching this function's existing "fail app startup
-    // loudly" policy) rather than falling back to an unprimed state is intentional.
-    let static_prefix = unsafe {
-        let state = ffi::xenon_state_new(engine);
-        ffi::xenon_state_reset(engine, state);
-        let text = CString::new(STATIC_PREFIX).expect("STATIC_PREFIX contains no NUL bytes");
-        let status = ffi::xenon_prefill(engine, state, text.as_ptr());
-        if status != ffi::XenonStatus::OK {
-            panic!("Failed to prefill Phase 8 static prefix: {}", last_error());
+    // Phase 8: prefill the two engine-level static preambles once per loaded model instead of on
+    // every generate/extraction call -- see `EngineInner`'s doc comment.
+    let prefill_static = |text: &str, what: &str| -> Result<XenonStatePtr, String> {
+        unsafe {
+            let state = ffi::xenon_state_new(engine);
+            ffi::xenon_state_reset(engine, state);
+            let c = CString::new(text).expect("static prefix contains no NUL bytes");
+            if ffi::xenon_prefill(engine, state, c.as_ptr()) != ffi::XenonStatus::OK {
+                let err = last_error();
+                ffi::xenon_state_free(state);
+                return Err(format!("Failed to prefill {what}: {err}"));
+            }
+            Ok(XenonStatePtr(state))
         }
-        XenonStatePtr(state)
     };
 
-    let extraction_prefix = unsafe {
-        let state = ffi::xenon_state_new(engine);
-        ffi::xenon_state_reset(engine, state);
-        let text = CString::new(EXTRACTION_STATIC_PREFIX)
-            .expect("EXTRACTION_STATIC_PREFIX contains no NUL bytes");
-        let status = ffi::xenon_prefill(engine, state, text.as_ptr());
-        if status != ffi::XenonStatus::OK {
-            panic!("Failed to prefill Phase 8 extraction prefix: {}", last_error());
+    let built = prefill_static(STATIC_PREFIX, "static prefix")
+        .and_then(|s| prefill_static(EXTRACTION_STATIC_PREFIX, "extraction prefix").map(|e| (s, e)));
+    match built {
+        Ok((static_prefix, extraction_prefix)) => Ok((
+            EngineInner {
+                engine: EnginePtr(engine),
+                static_prefix,
+                extraction_prefix,
+                conversation_cache: Vec::new(),
+            },
+            model_name,
+            device_label,
+        )),
+        Err(e) => {
+            unsafe { ffi::xenon_free_engine(engine) };
+            Err(e)
         }
-        XenonStatePtr(state)
-    };
+    }
+}
+
+/// Loads the model once at app startup: the tier saved by the last `switch_model` if its file is
+/// installed, otherwise the default tier, otherwise the first installed tier. Panics (fails app
+/// startup) rather than silently falling back to a stub -- per the phase spec, this app must call
+/// the real inference engine, not reimplement or fake it. Also returns a `ModelInfo` derived from
+/// the same path, so the name recorded in saved conversation files (Phase 5) can never drift from
+/// what's actually loaded.
+pub fn load_engine(app: &AppHandle, repo_root: &PathBuf) -> (EngineState, ModelInfo, DeviceInfo) {
+    let saved = saved_tier_id(app);
+    let preferred = saved.as_deref().unwrap_or(DEFAULT_TIER);
+    let model_path = tier_by_id(preferred)
+        .and_then(|t| tier_model_path(repo_root, t))
+        .or_else(|| tier_by_id(DEFAULT_TIER).and_then(|t| tier_model_path(repo_root, t)))
+        .or_else(|| MODEL_TIERS.iter().find_map(|t| tier_model_path(repo_root, t)))
+        .unwrap_or_else(|| panic!("No model file found under '{}'", repo_root.join("models").display()));
+
+    let (inner, model_name, device_label) = build_engine_inner(&model_path, &vocab_path_for(repo_root))
+        .unwrap_or_else(|e| panic!("{e}"));
 
     (
-        EngineState(Arc::new(Mutex::new(EngineInner {
-            engine: EnginePtr(engine),
-            static_prefix,
-            extraction_prefix,
-            conversation_cache: Vec::new(),
-        }))),
-        ModelInfo(model_name),
-        DeviceInfo(device_label),
+        EngineState(Arc::new(Mutex::new(inner))),
+        ModelInfo(Mutex::new(model_name)),
+        DeviceInfo(Mutex::new(device_label)),
     )
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelOption {
+    id: &'static str,
+    label: &'static str,
+    blurb: &'static str,
+    installed: bool,
+    #[serde(rename = "fileName")]
+    file_name: Option<String>,
+    active: bool,
+}
+
+#[tauri::command]
+pub fn list_models(
+    root: tauri::State<'_, crate::memory::RepoRoot>,
+    model_info: tauri::State<'_, ModelInfo>,
+) -> Vec<ModelOption> {
+    let current = model_info.0.lock().map(|g| g.clone()).unwrap_or_default();
+    MODEL_TIERS
+        .iter()
+        .map(|t| {
+            let file_name = tier_model_path(&root.0, t)
+                .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()));
+            ModelOption {
+                id: t.id,
+                label: t.label,
+                blurb: t.blurb,
+                installed: file_name.is_some(),
+                active: file_name.as_deref() == Some(current.as_str()),
+                file_name,
+            }
+        })
+        .collect()
+}
+
+/// Hot-swaps the loaded model. The new model is fully loaded and primed *before* the old one is
+/// touched, so a failure (missing file, unsupported weights) leaves the current model running.
+/// Waits for any in-flight generation/extraction to finish (they hold the engine lock). All cached
+/// conversation state belongs to the old model and is dropped with it; conversations rebuild their
+/// state from history on their next turn.
+#[tauri::command]
+pub async fn switch_model(
+    app: AppHandle,
+    engine: tauri::State<'_, EngineState>,
+    model_info: tauri::State<'_, ModelInfo>,
+    device_info: tauri::State<'_, DeviceInfo>,
+    root: tauri::State<'_, crate::memory::RepoRoot>,
+    tier_id: String,
+) -> Result<String, String> {
+    let tier = tier_by_id(&tier_id).ok_or_else(|| format!("Unknown model tier '{tier_id}'"))?;
+    let repo_root = root.0.clone();
+    let model_path = tier_model_path(&repo_root, tier).ok_or_else(|| {
+        format!("The {} model isn't installed (looked for: {})", tier.label, tier.candidates.join(", "))
+    })?;
+
+    let engine_arc = engine.0.clone();
+    let (name, device) = tauri::async_runtime::spawn_blocking(move || -> Result<(String, String), String> {
+        let (new_inner, name, device) = build_engine_inner(&model_path, &vocab_path_for(&repo_root))?;
+        let mut guard = match engine_arc.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let old = std::mem::replace(&mut *guard, new_inner);
+        drop(guard);
+        // States must be freed before the engine they were sized from.
+        let EngineInner { engine: old_engine, static_prefix, extraction_prefix, conversation_cache } = old;
+        drop(conversation_cache);
+        drop(static_prefix);
+        drop(extraction_prefix);
+        unsafe { ffi::xenon_free_engine(old_engine.0) };
+        Ok((name, device))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    if let Ok(mut g) = model_info.0.lock() {
+        *g = name.clone();
+    }
+    if let Ok(mut g) = device_info.0.lock() {
+        *g = device;
+    }
+    if let Err(e) = save_tier_id(&app, tier.id) {
+        eprintln!("[model] could not remember model choice: {e}");
+    }
+    Ok(name)
 }
 
 fn last_error() -> String {
@@ -412,7 +572,11 @@ extern "C" fn on_token(
         tail.push_str(text_str);
         let len = tail.len();
         if len > 64 {
-            tail.drain(0..len - 64);
+            let mut cut = len - 64;
+            while !tail.is_char_boundary(cut) {
+                cut += 1;
+            }
+            tail.drain(0..cut);
         }
 
         if ends_with_stop(&tail) {

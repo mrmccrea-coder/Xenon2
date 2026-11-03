@@ -42,6 +42,7 @@ from __future__ import annotations
 import json
 import sys
 import threading
+import time
 import traceback
 
 from vad import VoiceActivityDetector
@@ -51,6 +52,15 @@ from audio_io import record_from_mic, SAMPLE_RATE
 from speech_streamer import IncrementalSpeaker
 
 _stdout_lock = threading.Lock()
+
+# Minimum gap, in seconds, enforced between the end of TTS playback and the start of the
+# next mic capture. Without this, a `listen` issued right after `speak_finish` can pick up
+# the room's own residual/reverberating playback tail, which faster-whisper then happily
+# transcribes into a hallucinated phrase instead of timing out -- a real feedback loop
+# between this process's own speaker output and its own mic input, observed and documented
+# in app/README.md's Phase 7 section ("executed immediately after a TTS test on the same
+# speakers, returned a hallucinated transcript instead of a timeout").
+_SPEAK_COOLDOWN_SEC = 0.6
 
 
 def send(obj: dict) -> None:
@@ -83,10 +93,29 @@ class VoiceServer:
 
         self._speaker: IncrementalSpeaker | None = None
         self._speaker_lock = threading.Lock()
+        self._last_speak_done_at: float | None = None
+
+    def _wait_out_speaker_feedback(self) -> None:
+        """Block until it's safe to open the mic: never while the speaker is actively
+        playing this turn's reply, and never within `_SPEAK_COOLDOWN_SEC` of the last time
+        it finished, so the room's own playback tail can't bleed into the next capture."""
+        while True:
+            with self._speaker_lock:
+                speaking = self._speaker is not None
+            if not speaking:
+                break
+            time.sleep(0.05)
+
+        if self._last_speak_done_at is not None:
+            remaining = _SPEAK_COOLDOWN_SEC - (time.monotonic() - self._last_speak_done_at)
+            if remaining > 0:
+                time.sleep(remaining)
 
     def handle_listen(self, cmd: dict) -> None:
         max_listen_sec = float(cmd.get("maxListenSec", 6.0))
         max_utterance_sec = float(cmd.get("maxUtteranceSec", 10.0))
+
+        self._wait_out_speaker_feedback()
 
         mic_result = record_from_mic(
             self.vad, max_listen_sec=max_listen_sec, max_utterance_sec=max_utterance_sec
@@ -141,6 +170,7 @@ class VoiceServer:
         def _finish_and_notify():
             if speaker is not None:
                 speaker.finish(wait_for_playback=True)
+            self._last_speak_done_at = time.monotonic()
             send({"type": "speak_done"})
 
         threading.Thread(target=_finish_and_notify, daemon=True).start()

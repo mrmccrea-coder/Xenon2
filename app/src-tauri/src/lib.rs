@@ -72,7 +72,7 @@ pub fn run() {
 
             fit_window_to_screen(app);
 
-            let (engine_state, model_info, device_info) = inference::load_engine(&repo_root);
+            let (engine_state, model_info, device_info) = inference::load_engine(app.handle(), &repo_root);
             app.manage(engine_state);
             app.manage(model_info);
             app.manage(device_info);
@@ -166,6 +166,8 @@ pub fn run() {
             inference::generate_response,
             inference::get_model_name,
             inference::get_inference_device,
+            inference::list_models,
+            inference::switch_model,
             persistence::save_conversation_file,
             persistence::open_conversation_file,
             persistence::pick_save_dialog,

@@ -25,6 +25,12 @@ const props = defineProps<{
    * the sidecar's own startup instead of failing), but is visually dimmed with an explanatory
    * title so it doesn't look broken during the few seconds of startup. */
   voiceReady?: boolean;
+  /** True while the app's own spoken reply is queued or still audible through the speakers.
+   * The mic button stays disabled for this whole window -- see App.vue/stores/chat.ts's
+   * `speaking` and `voice-speak-done` handling, and ipc_server.py's `_wait_out_speaker_feedback`
+   * for why opening the mic during/right after TTS playback is a real feedback bug, not just a
+   * theoretical one. */
+  speaking?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -51,7 +57,7 @@ function onKeydown(e: KeyboardEvent) {
 }
 
 async function toggleMic() {
-  if (props.disabled || listening.value) return;
+  if (props.disabled || props.speaking || listening.value) return;
   listening.value = true;
   micStatus.value = "Listening...";
   try {
@@ -107,7 +113,14 @@ async function toggleMic() {
       <button
         class="mic-btn"
         :class="{ on: listening }"
-        :title="voiceReady === false ? 'Voice input is still starting up...' : 'Voice input'"
+        :disabled="speaking"
+        :title="
+          speaking
+            ? 'Voice input is disabled while Xenon is speaking'
+            : voiceReady === false
+              ? 'Voice input is still starting up...'
+              : 'Voice input'
+        "
         @click="toggleMic"
       >
         <!-- Inline SVG, not an emoji glyph -- the 🎤 emoji was found to render as an unrecognizable
@@ -232,6 +245,11 @@ async function toggleMic() {
   background: #b8402f;
   color: #fff;
   animation: mic-pulse 1s ease-in-out infinite;
+}
+
+.mic-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
 }
 
 @keyframes mic-pulse {
