@@ -18,6 +18,7 @@ import Sidebar from "./components/Sidebar.vue";
 import ChatMessageVue from "./components/ChatMessage.vue";
 import MessageInput from "./components/MessageInput.vue";
 import ModelPicker from "./components/ModelPicker.vue";
+import ModelSetup from "./components/ModelSetup.vue";
 import { useChatStore } from "./stores/chat";
 
 const store = useChatStore();
@@ -197,6 +198,7 @@ let unlistenImportDone: UnlistenFn | null = null;
 let unlistenImportError: UnlistenFn | null = null;
 let unlistenSlothFactsUpdated: UnlistenFn | null = null;
 let unlistenVoiceSpeakDone: UnlistenFn | null = null;
+let unlistenDownloadProgress: UnlistenFn | null = null;
 
 type MemoryProgressPayload = {
   file: string;
@@ -208,6 +210,11 @@ type MemoryProgressPayload = {
 type MemoryDonePayload = { filesCopied: number; totalBytes: number };
 type MemoryErrorPayload = { message: string };
 
+function openModelSetup() {
+  store.setupOpen = true;
+  void store.loadHardware(false);
+}
+
 onMounted(async () => {
   applyViewport();
   window.addEventListener("resize", applyViewport);
@@ -217,6 +224,13 @@ onMounted(async () => {
   // the last session (sidebar + last-active conversation) before wiring up generation events.
   await store.initModelName();
   await store.refreshModels();
+  unlistenDownloadProgress = await listen<{ tierId: string; done: number; total: number }>(
+    "model-download-progress",
+    (event) => store.onDownloadProgress(event.payload),
+  );
+  void store.loadHardware(false);
+  // Fresh install with no model: go straight to the setup screen instead of a dead chat.
+  if (store.modelStatus && !store.modelStatus.ready) store.setupOpen = true;
   await store.loadDataDirSetting();
   await store.restoreSession();
   scrollToBottom();
@@ -313,6 +327,7 @@ onUnmounted(() => {
   unlistenImportError?.();
   unlistenSlothFactsUpdated?.();
   unlistenVoiceSpeakDone?.();
+  unlistenDownloadProgress?.();
   unlistenWindowResize?.();
 });
 </script>
@@ -350,6 +365,7 @@ onUnmounted(() => {
             :busy="store.generating || store.switchingModel"
             :loading="store.switchingModel"
             @select="(id) => store.switchModel(id)"
+            @setup="openModelSetup"
           />
           <div v-if="!store.activeConversation" class="empty-state">
             <p>No conversation selected.</p>
@@ -381,7 +397,7 @@ onUnmounted(() => {
           </div>
 
           <MessageInput
-            :disabled="store.generating || store.switchingModel"
+            :disabled="store.generating || store.switchingModel || (store.modelStatus != null && !store.modelStatus.ready)"
             :voice-ready="store.voiceReady"
             :speaking="store.speaking"
             @send="sendMessage"
@@ -390,6 +406,8 @@ onUnmounted(() => {
         </div>
       </main>
     </div>
+
+    <ModelSetup v-if="store.setupOpen" />
 
     <!-- Phase 6: export/import progress -->
     <div v-if="store.memoryOp" class="modal-backdrop">

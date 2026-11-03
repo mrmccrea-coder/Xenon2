@@ -345,7 +345,7 @@ void run_benchmark(xenon_engine * engine) {
 int main(int argc, char ** argv) {
     std::string mode = argc > 1 ? argv[1] : "--correctness";
 
-    std::string model_path = "models\\rwkv-7-world-2.9B-Q5_1.bin";
+    std::string model_path = "models\\rwkv7-g1-2.9B-Q5_1.bin";
     std::string vocab_path;
     std::string exe_dir = get_exe_dir();
     vocab_path = exe_dir.empty() ? "inference-engine\\data\\world_vocab.bin" : exe_dir + "\\world_vocab.bin";

@@ -1,14 +1,23 @@
 <script setup lang="ts">
 // ModelPicker.vue -- always-visible Fast / Balanced / Quality switch at the top of the chat.
 
+import type { ModelOption } from "../stores/chat";
+
 defineProps<{
-  models: { id: string; label: string; blurb: string; installed: boolean; active: boolean }[];
+  models: ModelOption[];
   /** True while a reply is generating or a model is loading. */
   busy: boolean;
   loading: boolean;
 }>();
 
-defineEmits<{ (e: "select", id: string): void }>();
+defineEmits<{ (e: "select", id: string): void; (e: "setup"): void }>();
+
+function speed(m: ModelOption): string {
+  if (!m.installed) return "not installed";
+  if (!m.predictedTps) return m.blurb;
+  const t = m.predictedTps >= 10 ? m.predictedTps.toFixed(0) : m.predictedTps.toFixed(1);
+  return `~${t} words/sec`;
+}
 </script>
 
 <template>
@@ -20,14 +29,19 @@ defineEmits<{ (e: "select", id: string): void }>();
       :class="{ active: m.active, missing: !m.installed }"
       role="radio"
       :aria-checked="m.active"
-      :disabled="busy || !m.installed || m.active"
-      :title="m.installed ? m.blurb : 'Model file not installed'"
-      @click="$emit('select', m.id)"
+      :disabled="m.installed && (busy || m.active)"
+      :title="m.installed ? m.blurb : 'Not installed yet: click to download'"
+      @click="m.installed ? $emit('select', m.id) : $emit('setup')"
     >
-      <span class="pick-label">{{ m.label }}</span>
-      <span class="pick-blurb">{{ m.installed ? m.blurb : "not installed" }}</span>
+      <span class="pick-label">
+        {{ m.label }}<span v-if="m.recommended" class="star" title="Recommended for this computer"> ★</span>
+      </span>
+      <span class="pick-blurb">{{ speed(m) }}</span>
     </button>
     <span v-if="loading" class="pick-status">Loading model...</span>
+    <button class="gear" title="Set up models and see what suits this computer" @click="$emit('setup')">
+      Set up
+    </button>
   </div>
 </template>
 
@@ -65,6 +79,11 @@ defineEmits<{ (e: "select", id: string): void }>();
   cursor: default;
 }
 
+.pick.missing {
+  opacity: 0.65;
+  border-style: dashed;
+}
+
 .pick:disabled:not(.active) {
   opacity: 0.5;
   cursor: not-allowed;
@@ -72,6 +91,10 @@ defineEmits<{ (e: "select", id: string): void }>();
 
 .pick-label {
   font-weight: 600;
+}
+
+.star {
+  color: #f2c14e;
 }
 
 .pick-blurb {
@@ -83,5 +106,22 @@ defineEmits<{ (e: "select", id: string): void }>();
   font-size: 0.8rem;
   color: #aaa;
   white-space: nowrap;
+}
+
+.gear {
+  align-self: stretch;
+  padding: 0 0.7rem;
+  background: none;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  color: #bbb;
+  font: inherit;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.gear:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: #fff;
 }
 </style>

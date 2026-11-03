@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
 use crate::ffi;
+use crate::hardware;
+use crate::models_dl;
 use crate::sloth_memory;
 
 /// One turn of conversation, as sent from the Vue frontend. Mirrors the shape of a chat message
@@ -94,7 +96,8 @@ const MAX_CACHED_CONVERSATIONS: usize = 4;
 /// Everything needed to run generation, guarded by one mutex so only one generation (or cache
 /// mutation) runs at a time -- rwkv.cpp's per-engine state is not designed for concurrent calls,
 /// and Phase 8's incremental states are per-conversation data guarded alongside it, not a
-/// separate lock (see this struct's fields).
+/// separate lock (see this struct's fields). When no model is installed (or loading failed) the
+/// engine pointer is null; see `EngineInner::empty` and `is_loaded`.
 pub(crate) struct EngineInner {
     engine: EnginePtr,
     /// The conversation preamble (instruction + demo turns) -- byte-identical on every call ever
@@ -112,6 +115,34 @@ pub(crate) struct EngineInner {
     /// `MAX_CACHED_CONVERSATIONS` entries -- a linear scan over a handful of entries is simpler
     /// and just as fast as a HashMap + separate LRU list here.
     conversation_cache: Vec<(String, CachedConversation)>,
+    /// File this engine was loaded from; lets a failed low-memory switch reload the old model.
+    model_path: PathBuf,
+}
+
+impl EngineInner {
+    /// A placeholder with nothing loaded. Freeing null pointers is a documented no-op in
+    /// `xenon_inference.h`, so dropping this is safe.
+    fn empty() -> Self {
+        EngineInner {
+            engine: EnginePtr(std::ptr::null_mut()),
+            static_prefix: XenonStatePtr(std::ptr::null_mut()),
+            extraction_prefix: XenonStatePtr(std::ptr::null_mut()),
+            conversation_cache: Vec::new(),
+            model_path: PathBuf::new(),
+        }
+    }
+
+    fn is_loaded(&self) -> bool {
+        !self.engine.0.is_null()
+    }
+}
+
+impl Drop for EngineInner {
+    /// Per-conversation states are plain buffers that do not reference the engine, so freeing
+    /// the engine here and the states as fields drop afterwards is safe in either order.
+    fn drop(&mut self) {
+        unsafe { ffi::xenon_free_engine(self.engine.0) };
+    }
 }
 
 /// `Arc` (not a bare `Mutex`) because the IPC command below needs to clone a handle to it into a
@@ -124,7 +155,8 @@ pub struct EngineState(pub Arc<Mutex<EngineInner>>);
 /// The loaded model's name/version (its filename, minus extension, e.g.
 /// `"rwkv-5-world-0.4B-Q4_0"`), recorded so Phase 5's saved conversation files can note which
 /// model generated them (see `persistence::ConversationFile::model`). Computed once from the
-/// actual path `load_engine` loads, so it can never drift from what's really running.
+/// actual path `load_engine` loads, so it can never drift from what's really running. Empty when
+/// no model is loaded.
 pub struct ModelInfo(pub Mutex<String>);
 
 /// Short label for the menu bar. "CUDA — all layers on GPU" when offload succeeded.
@@ -154,13 +186,13 @@ const MODEL_TIERS: [ModelTier; 3] = [
     ModelTier {
         id: "fast",
         label: "Fast",
-        blurb: "~0.4B, lowest latency",
+        blurb: "~0.4B, quick but error-prone",
         candidates: &["rwkv7-g1-0.4B-Q5_1.bin", "rwkv-5-world-0.4B-Q4_0.bin"],
     },
     ModelTier {
         id: "balanced",
         label: "Balanced",
-        blurb: "~1.5B, speed/quality mix",
+        blurb: "~1.5B, good all-rounder",
         candidates: &["rwkv7-g1-1.5B-Q5_1.bin"],
     },
     ModelTier {
@@ -170,8 +202,6 @@ const MODEL_TIERS: [ModelTier; 3] = [
         candidates: &["rwkv7-g1-2.9B-Q5_1.bin", "rwkv-7-world-2.9B-Q5_1.bin"],
     },
 ];
-
-const DEFAULT_TIER: &str = "quality";
 
 fn tier_by_id(id: &str) -> Option<&'static ModelTier> {
     MODEL_TIERS.iter().find(|t| t.id == id)
@@ -183,7 +213,7 @@ fn tier_model_path(repo_root: &PathBuf, tier: &ModelTier) -> Option<PathBuf> {
 }
 
 fn vocab_path_for(repo_root: &PathBuf) -> PathBuf {
-    repo_root.join("inference-engine").join("data").join("world_vocab.bin")
+    crate::paths::resolve_vocab(repo_root)
 }
 
 fn choice_file(app: &AppHandle) -> Option<PathBuf> {
@@ -191,21 +221,31 @@ fn choice_file(app: &AppHandle) -> Option<PathBuf> {
     app.path().app_data_dir().ok().map(|d| d.join("model_choice.json"))
 }
 
-/// The tier saved by the last `switch_model`, if any. Kept in its own file (not `Settings`) because
-/// the frontend rewrites the whole settings struct whenever the data directory changes.
-fn saved_tier_id(app: &AppHandle) -> Option<String> {
-    let raw = std::fs::read_to_string(choice_file(app)?).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+fn parse_saved_tier(raw: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
     v.get("tier")?.as_str().map(|s| s.to_string())
 }
 
-fn save_tier_id(app: &AppHandle, id: &str) -> Result<(), String> {
+/// The tier saved by the last `switch_model` (or first-run auto-selection), if any. Kept in its
+/// own file (not `Settings`) because the frontend rewrites the whole settings struct whenever the
+/// data directory changes.
+fn saved_tier_id(app: &AppHandle) -> Option<String> {
+    parse_saved_tier(&std::fs::read_to_string(choice_file(app)?).ok()?)
+}
+
+fn save_tier_id(app: &AppHandle, id: &str, auto: bool) -> Result<(), String> {
     let path = choice_file(app).ok_or("Could not resolve the app data directory")?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("Could not create '{}': {e}", dir.display()))?;
     }
-    std::fs::write(&path, serde_json::json!({ "tier": id }).to_string())
+    std::fs::write(&path, serde_json::json!({ "tier": id, "auto": auto }).to_string())
         .map_err(|e| format!("Could not write '{}': {e}", path.display()))
+}
+
+/// Switching loads the new model while the old one is still resident, which needs both in RAM at
+/// once. When that would not leave comfortable headroom, release the old model first instead.
+fn should_unload_first(available_mb: u64, new_file_mb: u64) -> bool {
+    available_mb < new_file_mb * 13 / 10 + 1024
 }
 
 /// Loads `model_path`, prefills the two static preambles, and returns the ready-to-use engine
@@ -223,7 +263,7 @@ fn build_engine_inner(model_path: &PathBuf, vocab_path: &PathBuf) -> Result<(Eng
         .map_err(|_| "vocab path contains NUL byte".to_string())?;
 
     // GPU offload is preferred when this binary was built with CUDA (see build.rs, which links
-    // build-cuda-app ahead of build-cpu-app). An RTX 2060 has 6GB; the 2.9B Q5_1 file is ~2.75GB
+    // build-cuda-app ahead of build-cpu-app). An RTX 2060 has 6GB; this Q5_1 file is ~2.75GB
     // and the RWKV state is ~21MB, so every layer fits. If CUDA init fails, load retries on CPU
     // so a CUDA build still starts on a machine with no NVIDIA GPU.
     // 6 threads matches the CLI harness default. rwkv.cpp clamps n_gpu_layers to n_layer+1,
@@ -270,7 +310,6 @@ fn build_engine_inner(model_path: &PathBuf, vocab_path: &PathBuf) -> Result<(Eng
         "CPU".to_string()
     };
     eprintln!("xenon2: inference device: {device_label}");
-
     // Phase 8: prefill the two engine-level static preambles once per loaded model instead of on
     // every generate/extraction call -- see `EngineInner`'s doc comment.
     let prefill_static = |text: &str, what: &str| -> Result<XenonStatePtr, String> {
@@ -296,6 +335,7 @@ fn build_engine_inner(model_path: &PathBuf, vocab_path: &PathBuf) -> Result<(Eng
                 static_prefix,
                 extraction_prefix,
                 conversation_cache: Vec::new(),
+                model_path: model_path.clone(),
             },
             model_name,
             device_label,
@@ -307,29 +347,204 @@ fn build_engine_inner(model_path: &PathBuf, vocab_path: &PathBuf) -> Result<(Eng
     }
 }
 
-/// Loads the model once at app startup: the tier saved by the last `switch_model` if its file is
-/// installed, otherwise the default tier, otherwise the first installed tier. Panics (fails app
-/// startup) rather than silently falling back to a stub -- per the phase spec, this app must call
-/// the real inference engine, not reimplement or fake it. Also returns a `ModelInfo` derived from
-/// the same path, so the name recorded in saved conversation files (Phase 5) can never drift from
-/// what's actually loaded.
-pub fn load_engine(app: &AppHandle, repo_root: &PathBuf) -> (EngineState, ModelInfo, DeviceInfo) {
-    let saved = saved_tier_id(app);
-    let preferred = saved.as_deref().unwrap_or(DEFAULT_TIER);
-    let model_path = tier_by_id(preferred)
-        .and_then(|t| tier_model_path(repo_root, t))
-        .or_else(|| tier_by_id(DEFAULT_TIER).and_then(|t| tier_model_path(repo_root, t)))
-        .or_else(|| MODEL_TIERS.iter().find_map(|t| tier_model_path(repo_root, t)))
-        .unwrap_or_else(|| panic!("No model file found under '{}'", repo_root.join("models").display()));
+// ---------------------------------------------------------------------------------------------
+// Hardware profile, first-run model choice, and load status
+// ---------------------------------------------------------------------------------------------
 
-    let (inner, model_name, device_label) = build_engine_inner(&model_path, &vocab_path_for(repo_root))
-        .unwrap_or_else(|e| panic!("{e}"));
+/// (kind, message) describing the most recent startup outcome: kind "error" means no model is
+/// running (nothing installed / failed to load); "info" explains an automatic choice. Module-level
+/// so the setup code in lib.rs does not need another managed-state entry.
+static LOAD_NOTE: Mutex<Option<(String, String)>> = Mutex::new(None);
+static HW_CACHE: Mutex<Option<hardware::HardwareReport>> = Mutex::new(None);
+/// (effective GB/s, measured on this machine)
+static BW_CACHE: Mutex<Option<(f64, bool)>> = Mutex::new(None);
 
-    (
-        EngineState(Arc::new(Mutex::new(inner))),
-        ModelInfo(Mutex::new(model_name)),
-        DeviceInfo(Mutex::new(device_label)),
+fn set_note(kind: &str, message: impl Into<String>) {
+    if let Ok(mut g) = LOAD_NOTE.lock() {
+        *g = Some((kind.to_string(), message.into()));
+    }
+}
+
+fn clear_note() {
+    if let Ok(mut g) = LOAD_NOTE.lock() {
+        *g = None;
+    }
+}
+
+fn hardware_report(refresh: bool) -> hardware::HardwareReport {
+    if !refresh {
+        if let Some(h) = HW_CACHE.lock().ok().and_then(|g| g.clone()) {
+            return h;
+        }
+    }
+    let hw = hardware::detect();
+    if let Ok(mut g) = HW_CACHE.lock() {
+        *g = Some(hw.clone());
+    }
+    hw
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Calibrate {
+    Never,
+    IfMissing,
+    Force,
+}
+
+fn profile_path(app: &AppHandle) -> Option<PathBuf> {
+    use tauri::Manager;
+    app.path().app_data_dir().ok().map(|d| d.join("hardware_profile.json"))
+}
+
+fn tier_size_mb(repo_root: &PathBuf, tier: &ModelTier) -> u64 {
+    if let Some(p) = tier_model_path(repo_root, tier) {
+        if let Ok(m) = std::fs::metadata(&p) {
+            return m.len() / (1024 * 1024);
+        }
+    }
+    models_dl::entry_for_tier(tier.id).map(|e| e.size_bytes / (1024 * 1024)).unwrap_or(0)
+}
+
+/// Effective memory bandwidth for this machine: the cached measurement, a fresh measurement with
+/// the smallest installed model, or a conservative default when neither is available.
+fn bandwidth(app: &AppHandle, repo_root: &PathBuf, hw: &hardware::HardwareReport, mode: Calibrate) -> (f64, bool) {
+    let path = profile_path(app);
+    if mode != Calibrate::Force {
+        if let Some(cached) = BW_CACHE.lock().ok().and_then(|g| *g) {
+            return cached;
+        }
+        if let Some(p) = path.as_ref().and_then(|p| hardware::load_profile(p, &hw.cpu_name)) {
+            let v = (p.bandwidth_gbps, true);
+            if let Ok(mut g) = BW_CACHE.lock() {
+                *g = Some(v);
+            }
+            return v;
+        }
+    }
+    if mode != Calibrate::Never {
+        let smallest = MODEL_TIERS
+            .iter()
+            .filter_map(|t| tier_model_path(repo_root, t))
+            .min_by_key(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(u64::MAX));
+        if let Some(model) = smallest {
+            let threads = hardware::calibration_threads(hw);
+            if let Some(bw) = hardware::calibrate_cpu_bandwidth(&model, &vocab_path_for(repo_root), threads) {
+                if let Some(p) = &path {
+                    hardware::save_profile(p, &hardware::HardwareProfile { cpu_name: hw.cpu_name.clone(), bandwidth_gbps: bw });
+                }
+                if let Ok(mut g) = BW_CACHE.lock() {
+                    *g = Some((bw, true));
+                }
+                return (bw, true);
+            }
+        }
+    }
+    (hardware::DEFAULT_BW_GBPS, false)
+}
+
+fn recommendation(app: &AppHandle, repo_root: &PathBuf, hw: &hardware::HardwareReport, mode: Calibrate) -> hardware::Recommendation {
+    let (bw, measured) = bandwidth(app, repo_root, hw, mode);
+    let rows: Vec<(String, u64, bool)> = MODEL_TIERS
+        .iter()
+        .map(|t| (t.id.to_string(), tier_size_mb(repo_root, t), tier_model_path(repo_root, t).is_some()))
+        .collect();
+    hardware::recommend(hardware::estimate_tiers(hw, &rows, bw), bw, measured)
+}
+
+fn no_model_message(repo_root: &PathBuf) -> String {
+    format!(
+        "No model is installed yet. Use \"Set up models\" to download one, or copy a model file \
+         (for example rwkv7-g1-1.5B-Q5_1.bin) into {}.",
+        repo_root.join("models").display()
     )
+}
+
+/// Startup choice: the saved tier if its file is still there, otherwise the best installed tier
+/// for this machine (measuring it the first time). Returns (path, tier, reason if automatic).
+fn choose_startup_model(
+    app: &AppHandle,
+    repo_root: &PathBuf,
+    hw: &hardware::HardwareReport,
+) -> Result<(PathBuf, &'static ModelTier, Option<String>), String> {
+    if let Some(tier) = saved_tier_id(app).as_deref().and_then(tier_by_id) {
+        if let Some(path) = tier_model_path(repo_root, tier) {
+            return Ok((path, tier, None));
+        }
+    }
+    let rec = recommendation(app, repo_root, hw, Calibrate::IfMissing);
+    let tier = rec
+        .best_installed
+        .as_deref()
+        .and_then(tier_by_id)
+        .ok_or_else(|| no_model_message(repo_root))?;
+    let path = tier_model_path(repo_root, tier).ok_or_else(|| no_model_message(repo_root))?;
+    Ok((path, tier, Some(rec.reason)))
+}
+
+/// Loads the model once at app startup. Never panics: with nothing installed, or a model that
+/// fails to load, the app still opens (with an empty engine and an explanatory `LOAD_NOTE`) so the
+/// user can download or pick a model instead of seeing a crash. Also returns a `ModelInfo` derived
+/// from the same path, so the name recorded in saved conversation files (Phase 5) can never drift
+/// from what's actually loaded.
+pub fn load_engine(app: &AppHandle, repo_root: &PathBuf) -> (EngineState, ModelInfo, DeviceInfo) {
+    clear_note();
+    let hw = hardware_report(true);
+    let vocab = vocab_path_for(repo_root);
+
+    let loaded = choose_startup_model(app, repo_root, &hw).and_then(|(path, tier, auto_reason)| {
+        let r = build_engine_inner(&path, &vocab)?;
+        if let Some(reason) = auto_reason {
+            if let Err(e) = save_tier_id(app, tier.id, true) {
+                eprintln!("[model] could not remember automatic choice: {e}");
+            }
+            set_note("info", format!("Chose {} automatically for this computer: {reason}.", tier.label));
+        }
+        Ok(r)
+    });
+
+    match loaded {
+        Ok((inner, model_name, device_label)) => (
+            EngineState(Arc::new(Mutex::new(inner))),
+            ModelInfo(Mutex::new(model_name)),
+            DeviceInfo(Mutex::new(device_label)),
+        ),
+        Err(message) => {
+            eprintln!("xenon2: no model loaded: {message}");
+            set_note("error", message);
+            (
+                EngineState(Arc::new(Mutex::new(EngineInner::empty()))),
+                ModelInfo(Mutex::new(String::new())),
+                DeviceInfo(Mutex::new("No model loaded".to_string())),
+            )
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelStatus {
+    ready: bool,
+    name: String,
+    #[serde(rename = "noteKind")]
+    note_kind: Option<String>,
+    note: Option<String>,
+    #[serde(rename = "modelsDir")]
+    models_dir: String,
+}
+
+#[tauri::command]
+pub fn get_model_status(
+    root: tauri::State<'_, crate::memory::RepoRoot>,
+    model_info: tauri::State<'_, ModelInfo>,
+) -> ModelStatus {
+    let name = model_info.0.lock().map(|g| g.clone()).unwrap_or_default();
+    let note = LOAD_NOTE.lock().ok().and_then(|g| g.clone());
+    ModelStatus {
+        ready: !name.is_empty(),
+        name,
+        note_kind: note.as_ref().map(|n| n.0.clone()),
+        note: note.map(|n| n.1),
+        models_dir: root.0.join("models").display().to_string(),
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -341,36 +556,80 @@ pub struct ModelOption {
     #[serde(rename = "fileName")]
     file_name: Option<String>,
     active: bool,
+    #[serde(rename = "sizeMb")]
+    size_mb: u64,
+    recommended: bool,
+    #[serde(rename = "predictedTps")]
+    predicted_tps: f64,
+    verdict: String,
+    #[serde(rename = "canDownload")]
+    can_download: bool,
 }
 
 #[tauri::command]
 pub fn list_models(
+    app: AppHandle,
     root: tauri::State<'_, crate::memory::RepoRoot>,
     model_info: tauri::State<'_, ModelInfo>,
 ) -> Vec<ModelOption> {
     let current = model_info.0.lock().map(|g| g.clone()).unwrap_or_default();
+    let hw = hardware_report(false);
+    let rec = recommendation(&app, &root.0, &hw, Calibrate::Never);
     MODEL_TIERS
         .iter()
         .map(|t| {
             let file_name = tier_model_path(&root.0, t)
                 .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()));
+            let est = rec.estimates.iter().find(|e| e.id == t.id);
             ModelOption {
                 id: t.id,
                 label: t.label,
                 blurb: t.blurb,
                 installed: file_name.is_some(),
-                active: file_name.as_deref() == Some(current.as_str()),
+                active: !current.is_empty() && file_name.as_deref() == Some(current.as_str()),
                 file_name,
+                size_mb: tier_size_mb(&root.0, t),
+                recommended: rec.recommended == t.id,
+                predicted_tps: est.map(|e| e.predicted_tps).unwrap_or(0.0),
+                verdict: est.map(|e| e.verdict.clone()).unwrap_or_default(),
+                can_download: models_dl::entry_for_tier(t.id).is_some(),
             }
         })
         .collect()
 }
 
-/// Hot-swaps the loaded model. The new model is fully loaded and primed *before* the old one is
-/// touched, so a failure (missing file, unsupported weights) leaves the current model running.
-/// Waits for any in-flight generation/extraction to finish (they hold the engine lock). All cached
-/// conversation state belongs to the old model and is dropped with it; conversations rebuild their
-/// state from history on their next turn.
+#[derive(Debug, Clone, Serialize)]
+pub struct HardwareView {
+    hardware: hardware::HardwareReport,
+    recommendation: hardware::Recommendation,
+}
+
+/// Hardware summary plus per-tier speed predictions. `refresh` re-detects the hardware and
+/// re-measures memory bandwidth (about two seconds); otherwise cached values are used.
+#[tauri::command]
+pub async fn get_hardware_report(
+    app: AppHandle,
+    root: tauri::State<'_, crate::memory::RepoRoot>,
+    refresh: bool,
+) -> Result<HardwareView, String> {
+    let repo_root = root.0.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let hw = hardware_report(refresh);
+        let mode = if refresh { Calibrate::Force } else { Calibrate::Never };
+        let recommendation = recommendation(&app, &repo_root, &hw, mode);
+        HardwareView { hardware: hw, recommendation }
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Hot-swaps the loaded model. Normally the new model is fully loaded and primed *before* the old
+/// one is touched, so a failure (missing file, unsupported weights) leaves the current model
+/// running. When free RAM cannot hold both at once (see `should_unload_first`) the old model is
+/// released first, and reloaded if the new one fails to load. Waits for any in-flight
+/// generation/extraction to finish (they hold the engine lock). All cached conversation state
+/// belongs to the old model and is dropped with it; conversations rebuild their state from
+/// history on their next turn.
 #[tauri::command]
 pub async fn switch_model(
     app: AppHandle,
@@ -388,19 +647,40 @@ pub async fn switch_model(
 
     let engine_arc = engine.0.clone();
     let (name, device) = tauri::async_runtime::spawn_blocking(move || -> Result<(String, String), String> {
-        let (new_inner, name, device) = build_engine_inner(&model_path, &vocab_path_for(&repo_root))?;
+        let vocab = vocab_path_for(&repo_root);
+        let new_mb = std::fs::metadata(&model_path).map(|m| m.len() / (1024 * 1024)).unwrap_or(0);
+
+        if should_unload_first(hardware::available_ram_mb(), new_mb) {
+            let mut guard = match engine_arc.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let old_path = guard.model_path.clone();
+            *guard = EngineInner::empty(); // drops (frees) the old model
+            return match build_engine_inner(&model_path, &vocab) {
+                Ok((inner, name, device)) => {
+                    *guard = inner;
+                    Ok((name, device))
+                }
+                Err(e) => {
+                    if old_path.as_os_str().is_empty() {
+                        Err(e)
+                    } else if let Ok((inner, _, _)) = build_engine_inner(&old_path, &vocab) {
+                        *guard = inner;
+                        Err(format!("{e} (the previous model was restored)"))
+                    } else {
+                        Err(format!("{e} (and the previous model could not be reloaded)"))
+                    }
+                }
+            };
+        }
+
+        let (new_inner, name, device) = build_engine_inner(&model_path, &vocab)?;
         let mut guard = match engine_arc.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        let old = std::mem::replace(&mut *guard, new_inner);
-        drop(guard);
-        // States must be freed before the engine they were sized from.
-        let EngineInner { engine: old_engine, static_prefix, extraction_prefix, conversation_cache } = old;
-        drop(conversation_cache);
-        drop(static_prefix);
-        drop(extraction_prefix);
-        unsafe { ffi::xenon_free_engine(old_engine.0) };
+        *guard = new_inner; // drops (frees) the old model
         Ok((name, device))
     })
     .await
@@ -412,7 +692,8 @@ pub async fn switch_model(
     if let Ok(mut g) = device_info.0.lock() {
         *g = device;
     }
-    if let Err(e) = save_tier_id(&app, tier.id) {
+    clear_note();
+    if let Err(e) = save_tier_id(&app, tier.id, false) {
         eprintln!("[model] could not remember model choice: {e}");
     }
     Ok(name)
@@ -883,6 +1164,16 @@ fn generate_blocking(
     history: Vec<ChatTurn>,
     agent: String,
 ) -> Option<PendingExtraction> {
+    if !inner.is_loaded() {
+        let _ = app.emit(
+            "generation-error",
+            GenerationErrorEvent {
+                conversation_id,
+                message: "No model is loaded. Open \"Set up models\" to download or choose one.".to_string(),
+            },
+        );
+        return None;
+    }
     let engine = inner.engine.0;
 
     // `prior_turns` is everything already-happened; the newest user turn is what this call
@@ -1057,6 +1348,9 @@ pub async fn generate_response(
                     Err(poisoned) => poisoned.into_inner(),
                 };
                 debug_timing_log("engine lock acquired (extraction)");
+                if !guard.is_loaded() {
+                    return;
+                }
                 run_fact_extraction(
                     guard.engine.0,
                     &guard.extraction_prefix,
@@ -1070,4 +1364,92 @@ pub async fn generate_response(
     })
     .await
     .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod model_tests {
+    use super::*;
+
+    fn temp_root(name: &str, files: &[&str]) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("xenon_inf_{}_{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("models")).unwrap();
+        for f in files {
+            std::fs::write(root.join("models").join(f), b"x").unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn tier_prefers_the_new_file_over_the_legacy_one() {
+        let root = temp_root("prefer", &["rwkv7-g1-2.9B-Q5_1.bin", "rwkv-7-world-2.9B-Q5_1.bin"]);
+        let p = tier_model_path(&root, tier_by_id("quality").unwrap()).unwrap();
+        assert!(p.ends_with("rwkv7-g1-2.9B-Q5_1.bin"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tier_falls_back_to_the_legacy_file() {
+        let root = temp_root("fallback", &["rwkv-7-world-2.9B-Q5_1.bin", "rwkv-5-world-0.4B-Q4_0.bin"]);
+        assert!(tier_model_path(&root, tier_by_id("quality").unwrap()).unwrap().ends_with("rwkv-7-world-2.9B-Q5_1.bin"));
+        assert!(tier_model_path(&root, tier_by_id("fast").unwrap()).unwrap().ends_with("rwkv-5-world-0.4B-Q4_0.bin"));
+        assert!(tier_model_path(&root, tier_by_id("balanced").unwrap()).is_none(), "no balanced file and no legacy substitute");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unknown_tier_is_rejected() {
+        assert!(tier_by_id("ultra").is_none());
+    }
+
+    #[test]
+    fn low_ram_switch_unloads_first() {
+        // 2.9B (2625 MB) needs 2625*1.3 + 1024 = 4436 MB free to coexist with the old model.
+        assert!(should_unload_first(4000, 2625));
+        assert!(!should_unload_first(16000, 2625));
+        assert!(should_unload_first(1500, 525), "even the small model needs headroom on a tight machine");
+        assert!(!should_unload_first(2500, 525));
+    }
+
+    #[test]
+    fn saved_choice_parses_old_and_new_formats() {
+        assert_eq!(parse_saved_tier(r#"{"tier":"balanced"}"#).as_deref(), Some("balanced"));
+        assert_eq!(parse_saved_tier(r#"{"tier":"fast","auto":true}"#).as_deref(), Some("fast"));
+        assert_eq!(parse_saved_tier("not json"), None);
+        assert_eq!(parse_saved_tier("{}"), None);
+    }
+
+    #[test]
+    fn empty_engine_is_not_loaded_and_drops_safely() {
+        let e = EngineInner::empty();
+        assert!(!e.is_loaded());
+        drop(e); // frees a null engine: documented no-op
+    }
+
+    /// Needs the real model files and the engine DLL: `cargo test -- --ignored`.
+    /// Covers hot-swap, failed-switch recovery, and the cache being dropped with the old model.
+    #[test]
+    #[ignore]
+    fn hot_swap_and_failed_switch_keep_a_working_engine() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap().to_path_buf();
+        let vocab = vocab_path_for(&root);
+        let small = tier_model_path(&root, tier_by_id("fast").unwrap()).expect("fast model installed");
+        let mid = tier_model_path(&root, tier_by_id("balanced").unwrap()).expect("balanced model installed");
+
+        let (first, name1, _) = build_engine_inner(&small, &vocab).unwrap();
+        let holder = Mutex::new(first);
+        assert!(holder.lock().unwrap().is_loaded());
+
+        let (second, name2, _) = build_engine_inner(&mid, &vocab).unwrap();
+        assert_ne!(name1, name2);
+        *holder.lock().unwrap() = second; // old engine freed by Drop
+        assert_eq!(holder.lock().unwrap().model_path, mid);
+
+        // A bad file must fail cleanly and leave the loaded engine untouched.
+        let bad = std::env::temp_dir().join(format!("xenon_bad_{}.bin", std::process::id()));
+        std::fs::write(&bad, b"not a model").unwrap();
+        assert!(build_engine_inner(&bad, &vocab).is_err());
+        assert!(holder.lock().unwrap().is_loaded());
+        let _ = std::fs::remove_file(bad);
+    }
 }

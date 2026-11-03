@@ -1,11 +1,13 @@
 mod ffi;
+mod hardware;
 mod inference;
 mod memory;
+mod models_dl;
+mod paths;
 mod persistence;
 mod sloth_memory;
 mod voice;
 
-use std::path::PathBuf;
 use tauri::{Manager, PhysicalPosition, PhysicalSize};
 
 /// Open maximized on the monitor the window is actually on, so a 1920x1080 laptop
@@ -58,17 +60,10 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
-            // Repo root = two levels up from this crate (app/src-tauri -> app -> <repo root>),
-            // so the app finds Phase 1's model/vocab files without needing them copied into
-            // app/ or bundled -- fine for this dev-focused phase; portable/USB-relative paths
-            // are Phase 6's job (see PLAN.md).
-            let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-            let repo_root = manifest_dir
-                .parent()
-                .expect("app/ dir")
-                .parent()
-                .expect("repo root")
-                .to_path_buf();
+            // Data root: the dev checkout when running from one (two levels up from this crate),
+            // otherwise a portable folder beside the executable, otherwise the per-user app data
+            // folder -- see paths.rs. Models live in `<root>/models`.
+            let repo_root = paths::resolve_repo_root(app.handle());
 
             fit_window_to_screen(app);
 
@@ -80,6 +75,7 @@ pub fn run() {
             // voice-pipeline/models/ relative to the repo root too, so it's kept as managed state
             // instead of being recomputed from CARGO_MANIFEST_DIR a second time.
             app.manage(memory::RepoRoot(repo_root.clone()));
+            app.manage(models_dl::DownloadState::default());
 
             // Phase 7: spawn the voice-pipeline sidecar (see voice.rs's module doc). Model
             // loading happens inside the sidecar process itself (a few seconds for STT/TTS), so
@@ -168,6 +164,10 @@ pub fn run() {
             inference::get_inference_device,
             inference::list_models,
             inference::switch_model,
+            inference::get_model_status,
+            inference::get_hardware_report,
+            models_dl::download_model,
+            models_dl::cancel_model_download,
             persistence::save_conversation_file,
             persistence::open_conversation_file,
             persistence::pick_save_dialog,

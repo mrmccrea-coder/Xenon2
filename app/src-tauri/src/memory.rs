@@ -236,11 +236,13 @@ struct PlanEntry {
     rel: String,
 }
 
-fn required_model_files(repo_root: &Path) -> Vec<PlanEntry> {
+/// `active_model` is the loaded model's file stem (what `ModelInfo` holds); the bundle carries
+/// exactly that file, so an export after switching models contains the model actually in use.
+fn required_model_files(repo_root: &Path, active_model: &str) -> Vec<PlanEntry> {
     vec![
         PlanEntry {
-            src: repo_root.join("models").join("rwkv-7-world-2.9B-Q5_1.bin"),
-            rel: "models/rwkv-7-world-2.9B-Q5_1.bin".to_string(),
+            src: repo_root.join("models").join(format!("{active_model}.bin")),
+            rel: format!("models/{active_model}.bin"),
         },
         PlanEntry {
             src: repo_root
@@ -266,6 +268,21 @@ fn required_model_files(repo_root: &Path) -> Vec<PlanEntry> {
     ]
 }
 
+/// Model weight files in a bundle's `models/` folder: every `.bin` except the tokenizer vocab.
+fn bundle_model_files(models_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(models_dir) else { return Vec::new() };
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension().is_some_and(|ext| ext == "bin")
+                && p.file_name().is_some_and(|n| n != "world_vocab.bin")
+        })
+        .collect();
+    files.sort();
+    files
+}
+
 /// Exports the real runtime files (quantized model + vocab + voice model + all conversations +
 /// session.json) into `<destination>/xenon2-backup/`, matching the layout in `EXPORT_FORMAT.md`.
 /// Deliberately excludes the `.pth`/FP16 conversion intermediates (~1.8GB, not loaded at runtime)
@@ -274,9 +291,16 @@ fn required_model_files(repo_root: &Path) -> Vec<PlanEntry> {
 pub async fn export_memory(
     app: AppHandle,
     repo_root: tauri::State<'_, RepoRoot>,
+    model_info: tauri::State<'_, crate::inference::ModelInfo>,
     destination: String,
 ) -> Result<(), String> {
     let repo_root = repo_root.0.clone();
+    let active_model = model_info.0.lock().map(|g| g.clone()).unwrap_or_default();
+    if active_model.is_empty() {
+        let msg = "No model is loaded, so there is no working bundle to export. Load or download a model first.".to_string();
+        let _ = app.emit("export-error", MemoryErrorEvent { message: msg.clone() });
+        return Err(msg);
+    }
     let dest_root = PathBuf::from(&destination).join("xenon2-backup");
 
     let app_data = app_data_dir(&app)?;
@@ -287,7 +311,7 @@ pub async fn export_memory(
     let dest_root_for_closure = dest_root.clone();
     let result = tauri::async_runtime::spawn_blocking(move || -> Result<(usize, u64), String> {
         let dest_root = dest_root_for_closure;
-        let mut plan = required_model_files(&repo_root);
+        let mut plan = required_model_files(&repo_root, &active_model);
 
         for entry in &plan {
             if !entry.src.exists() {
@@ -404,11 +428,9 @@ pub async fn import_memory(
 
         let mut plan: Vec<PlanEntry> = Vec::new();
 
-        if models_dir.join("rwkv-7-world-2.9B-Q5_1.bin").exists() {
-            plan.push(PlanEntry {
-                src: models_dir.join("rwkv-7-world-2.9B-Q5_1.bin"),
-                rel: "models/rwkv-7-world-2.9B-Q5_1.bin".to_string(),
-            });
+        for path in bundle_model_files(&models_dir) {
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            plan.push(PlanEntry { src: path, rel: format!("models/{name}") });
         }
         if models_dir.join("world_vocab.bin").exists() {
             plan.push(PlanEntry {
@@ -548,4 +570,32 @@ fn resolve_bundle_root(picked: &Path) -> PathBuf {
         return nested;
     }
     picked.to_path_buf()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn export_plan_names_the_active_model() {
+        let plan = required_model_files(Path::new("/r"), "rwkv7-g1-1.5B-Q5_1");
+        assert_eq!(plan[0].rel, "models/rwkv7-g1-1.5B-Q5_1.bin");
+        assert!(plan[0].src.ends_with("rwkv7-g1-1.5B-Q5_1.bin"));
+    }
+
+    #[test]
+    fn import_picks_up_any_model_but_not_the_vocab() {
+        let dir = std::env::temp_dir().join(format!("xenon_mem_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        for f in ["rwkv7-g1-2.9B-Q5_1.bin", "other-model.bin", "world_vocab.bin", "notes.txt"] {
+            fs::write(dir.join(f), b"x").unwrap();
+        }
+        let names: Vec<String> = bundle_model_files(&dir)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["other-model.bin", "rwkv7-g1-2.9B-Q5_1.bin"]);
+        let _ = fs::remove_dir_all(dir);
+    }
 }

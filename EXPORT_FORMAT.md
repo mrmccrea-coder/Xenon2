@@ -17,7 +17,8 @@ section) are:
   `<Tauri app-data-dir>/session.json` (or, if the Phase 6 "data directory location" setting is
   configured, `<configured-dir>/conversations/...` instead — see "Data directory location setting"
   below).
-- The quantized model actually loaded at runtime: `models/rwkv-7-world-2.9B-Q5_1.bin` (repo root;
+- The quantized model actually loaded at runtime (whichever tier is active; the bundle carries that
+  one file under its own name, e.g. `models/rwkv7-g1-1.5B-Q5_1.bin`): `models/rwkv-7-world-2.9B-Q5_1.bin` (repo root;
   upgraded from the original `rwkv-5-world-0.4B-Q4_0.bin` in a Phase 7 follow-up -- see
   `app/README.md`'s "Model upgrade" section).
 - The tokenizer vocab required to load it: `inference-engine/data/world_vocab.bin`.

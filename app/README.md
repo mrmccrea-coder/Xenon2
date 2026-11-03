@@ -788,3 +788,57 @@ millisecond) -- confirming extraction genuinely starts only after the reply is a
 Extraction itself then ran for **5.47 seconds** (132748 - 127276), entirely after the user already
 had their answer. Before this fix, that 5.47s was added directly to the user's visible wait *and*
 to the next turn's queueing delay; after it, both are zero.
+
+
+## Model picker, hardware detection and model downloads
+
+The top of the chat has three buttons, **Fast / Balanced / Quality**, plus a **Set up** button.
+Each tier maps to a model file in `models/` (first existing candidate wins, so older files still
+work): Fast = RWKV7-G1 0.4B, Balanced = G1 1.5B, Quality = G1 2.9B, all Q5_1. `inference.rs`
+holds the tier table (`MODEL_TIERS`); `model_catalog.json` holds each file's exact size and SHA-256.
+
+**Switching** (`switch_model`) loads the new model first and swaps it in under the engine lock, so a
+failed load leaves the old model running. If free RAM cannot hold both models at once
+(`should_unload_first`: less than 1.3x the new file plus 1 GB), it releases the old model first
+and reloads it if the new one fails to load. The choice is saved in `model_choice.json` in the app
+data folder (separate from `settings.json`, which the data-directory setting rewrites whole).
+
+**Hardware detection** (`hardware.rs`) reads the CPU, RAM and GPUs at startup: `sysinfo` for
+CPU/RAM; `nvidia-smi` for NVIDIA name and VRAM; PowerShell (Windows), `lspci` (Linux) or
+`system_profiler` (macOS) for other GPUs, which report no VRAM. Speed is predicted as
+`memory bandwidth / model size`, because decoding is memory-bandwidth bound (measured: 4 to 16
+threads moved the 2.9B from 5.2 to 6.0 tok/s). On first run the app measures bandwidth with about
+two seconds of CPU decode on the smallest installed model and caches it per CPU in
+`hardware_profile.json`; **Re-check** in the Set up screen repeats it. The recommended tier is the
+largest that predicts at least 5 tok/s and fits RAM (then the largest at 2.5 tok/s or more, else the
+smallest). An NVIDIA GPU counts only if the linked engine was built with CUDA and VRAM is at least
+the model size + 800 MB. The derate factor (0.70) was fitted on the dev machine only.
+
+**First run** with no saved choice picks the best *installed* tier for the machine and says so in
+the Set up screen. With **no model installed** the app still opens (it used to panic) and shows the
+Set up screen; chat is disabled until a model exists.
+
+**Downloads** (`models_dl.rs`) are resumable (HTTP Range), verified against the catalog SHA-256, and
+written via `<file>.part`. The model files are rwkv.cpp-format conversions of BlinkDL's `.pth`
+checkpoints, which needs Python + torch, so they must be hosted somewhere. `baseUrl` in
+`model_catalog.json` is empty until a host exists; override without rebuilding using the
+`XENON_MODEL_BASE_URL` environment variable or a `model_source.txt` in the app data folder (file URL is
+`<base>/<file name>`). Until then Download reports that no source is configured, and a model file
+copied into `models/` by hand works as before.
+
+**Where files live** (`paths.rs`): `XENON_HOME` if set, else the repo checkout when running from
+one, else a portable folder beside the executable (anything with `models/` or `world_vocab.bin`),
+else the per-user app data folder. Export Memory now bundles the model that is *loaded*, and
+Import restores whichever model files the bundle holds.
+
+**Installer**: `scripts/build_installer.ps1` builds the MSI and NSIS setup with the CPU engine
+(runs on any PC) and `world_vocab.bin` as a bundled resource. Models are not in the installer.
+
+**Tests**: `PATH="$PATH:$(pwd)/target/debug" cargo test` from `src-tauri/` (the test binary needs the
+engine DLL on PATH). `cargo test -- --ignored` also runs the real-model hot-swap test.
+
+**Known limits**: the app links one engine variant at build time (`build.rs` prefers
+`build-cuda-app`), so one binary cannot be both a CUDA build and a CPU-only build; `build.rs` copies
+engine DLLs from the folder holding the `.lib`, which on Windows is not where the DLLs are, so the
+DLLs next to the exe can be stale after rebuilding the engine (copy them from
+`inference-engine/build-*-app/bin/Release/`); the engine runs 6 threads regardless of core count.

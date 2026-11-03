@@ -117,6 +117,12 @@ interface ChatState {
 
   // --- Model selector ---
   models: ModelOption[];
+  modelStatus: ModelStatus | null;
+  hardware: HardwareView | null;
+  hardwareLoading: boolean;
+  /** tierId -> download progress, present from the moment a download starts. */
+  downloads: Record<string, DownloadState>;
+  setupOpen: boolean;
   /** True while a model hot-swap is loading; the UI disables chat input for the duration. */
   switchingModel: boolean;
 }
@@ -128,6 +134,54 @@ export interface ModelOption {
   installed: boolean;
   fileName: string | null;
   active: boolean;
+  sizeMb: number;
+  recommended: boolean;
+  /** Predicted decode speed on this computer (0 = unknown). */
+  predictedTps: number;
+  /** "comfortable" | "usable" | "slow" | "too big" */
+  verdict: string;
+  canDownload: boolean;
+}
+
+export interface ModelStatus {
+  ready: boolean;
+  name: string;
+  noteKind: "info" | "error" | null;
+  note: string | null;
+  modelsDir: string;
+}
+
+export interface GpuInfo {
+  name: string;
+  vendor: string;
+  vramMb: number | null;
+}
+
+export interface HardwareView {
+  hardware: {
+    cpuName: string;
+    physicalCores: number;
+    logicalCores: number;
+    totalRamMb: number;
+    availableRamMb: number;
+    gpus: GpuInfo[];
+    engineGpuSupport: boolean;
+    os: string;
+  };
+  recommendation: {
+    recommended: string;
+    bestInstalled: string | null;
+    reason: string;
+    bandwidthGbps: number;
+    measured: boolean;
+  };
+}
+
+export interface DownloadState {
+  done: number;
+  total: number;
+  active: boolean;
+  error: string | null;
 }
 
 export interface SlothFact {
@@ -168,6 +222,11 @@ export const useChatStore = defineStore("chat", {
     activeAgent: "dementia",
     slothFacts: [],
     models: [],
+    modelStatus: null,
+    hardware: null,
+    hardwareLoading: false,
+    downloads: {},
+    setupOpen: false,
     switchingModel: false,
   }),
 
@@ -245,9 +304,50 @@ export const useChatStore = defineStore("chat", {
     async refreshModels(): Promise<void> {
       try {
         this.models = await invoke<ModelOption[]>("list_models");
+        this.modelStatus = await invoke<ModelStatus>("get_model_status");
       } catch (err) {
         console.warn("[chat store] could not list models:", err);
       }
+    },
+
+    /** Hardware summary and per-model speed predictions. `refresh` re-detects the machine and
+     * re-measures memory speed (a couple of seconds). */
+    async loadHardware(refresh = false): Promise<void> {
+      this.hardwareLoading = true;
+      try {
+        this.hardware = await invoke<HardwareView>("get_hardware_report", { refresh });
+        await this.refreshModels();
+      } catch (err) {
+        console.warn("[chat store] could not read hardware:", err);
+      } finally {
+        this.hardwareLoading = false;
+      }
+    },
+
+    async downloadModel(tierId: string): Promise<void> {
+      if (Object.values(this.downloads).some((d) => d.active)) return;
+      const size = (this.models.find((m) => m.id === tierId)?.sizeMb ?? 0) * 1024 * 1024;
+      this.downloads[tierId] = { done: 0, total: size, active: true, error: null };
+      try {
+        await invoke("download_model", { tierId });
+        delete this.downloads[tierId];
+        await this.refreshModels();
+        // First model on a fresh install: start using it right away.
+        if (this.modelStatus && !this.modelStatus.ready) await this.switchModel(tierId);
+      } catch (err) {
+        const cancelled = String(err).includes("cancelled");
+        if (cancelled) delete this.downloads[tierId];
+        else this.downloads[tierId] = { ...this.downloads[tierId], active: false, error: String(err) };
+      }
+    },
+
+    cancelDownload(): void {
+      void invoke("cancel_model_download");
+    },
+
+    onDownloadProgress(p: { tierId: string; done: number; total: number }): void {
+      const cur = this.downloads[p.tierId];
+      if (cur) this.downloads[p.tierId] = { ...cur, done: p.done, total: p.total };
     },
 
     /** Hot-swaps the backend model to the given tier. On failure the old model keeps running and
