@@ -11,7 +11,8 @@
 // treated as one deletable unit rather than leaving an orphaned reply with no prompt above it.
 // Confirmed via a native confirm() before emitting, since this is destructive and there's no undo.
 
-import { ref } from "vue";
+import { ref, watch } from "vue";
+import { invoke } from "@tauri-apps/api/core";
 import type { ChatMessage } from "../types";
 
 const props = defineProps<{
@@ -29,6 +30,25 @@ const emit = defineEmits<{
 
 const isEditing = ref(false);
 const draft = ref("");
+
+// Generated pictures live on disk; load the PNG (as a data URL) whenever this message's image
+// path changes, e.g. after Regenerate redraws it.
+const imgSrc = ref("");
+const imgError = ref("");
+watch(
+  () => props.message.image,
+  async (path) => {
+    imgSrc.value = "";
+    imgError.value = "";
+    if (!path) return;
+    try {
+      imgSrc.value = await invoke<string>("read_image", { path });
+    } catch (err) {
+      imgError.value = `(image unavailable: ${String(err)})`;
+    }
+  },
+  { immediate: true }
+);
 
 function startEdit() {
   if (props.disabled) return;
@@ -92,7 +112,12 @@ function onDelete() {
       </template>
 
       <template v-else>
-        <div class="content">
+        <template v-if="message.image">
+          <img v-if="imgSrc" class="gen-image" :src="imgSrc" :alt="message.imagePrompt || 'Generated image'" />
+          <div v-else class="content">{{ imgError || "Loading image..." }}</div>
+          <div class="image-caption">{{ message.imagePrompt }}</div>
+        </template>
+        <div v-else class="content">
           {{ message.content }}<span v-if="message.streaming" class="cursor">▍</span>
         </div>
         <div v-if="message.edited" class="edited-tag">(edited)</div>
@@ -144,6 +169,20 @@ function onDelete() {
 
 .row.assistant {
   justify-content: flex-start;
+}
+
+.gen-image {
+  display: block;
+  max-width: 100%;
+  max-height: 60vh;
+  border-radius: 8px;
+}
+
+.image-caption {
+  margin-top: 0.35rem;
+  font-size: 0.75rem;
+  opacity: 0.65;
+  font-style: italic;
 }
 
 .bubble {

@@ -109,6 +109,42 @@ async function toggleMic() {
       </button>
     </div>
 
+    <div v-if="store.imageAvailable" class="agent-toggle image-toggle">
+      <button
+        class="agent-btn"
+        :class="{ active: store.imageMode }"
+        :disabled="disabled"
+        :title="
+          store.imageMode
+            ? 'Image mode ON: your next message is drawn as a picture (chat model is paused while it draws)'
+            : 'Turn on image mode to draw pictures instead of chatting'
+        "
+        @click="store.setImageMode(!store.imageMode)"
+      >
+        Image
+      </button>
+      <select
+        v-if="store.imageMode"
+        v-model.number="store.imageSize"
+        class="image-select"
+        :disabled="disabled"
+        title="Picture size (larger takes longer)"
+      >
+        <option :value="512">512</option>
+        <option :value="768">768</option>
+        <option :value="1024">1024</option>
+      </select>
+      <select
+        v-if="store.imageMode && store.imageModels.length > 1"
+        v-model="store.imageModel"
+        class="image-select"
+        :disabled="disabled"
+        title="Image model"
+      >
+        <option v-for="m in store.imageModels" :key="m.file" :value="m.file">{{ m.label }}</option>
+      </select>
+    </div>
+
     <div class="mic-wrap">
       <button
         class="mic-btn"
@@ -141,7 +177,7 @@ async function toggleMic() {
       v-model="text"
       class="text-box"
       rows="1"
-      placeholder="Type a message..."
+      :placeholder="store.imageMode ? 'Describe the picture you want...' : 'Type a message...'"
       :disabled="disabled"
       @keydown="onKeydown"
     ></textarea>
@@ -207,6 +243,15 @@ async function toggleMic() {
   cursor: pointer;
 }
 
+.image-select {
+  background: #232324;
+  color: #ccc;
+  border: none;
+  border-left: 1px solid rgba(255, 255, 255, 0.15);
+  height: 2.3rem;
+  font-size: 0.75rem;
+  max-width: 9rem;
+}
 .agent-btn.active {
   background: #3a3a6b;
   color: #fff;

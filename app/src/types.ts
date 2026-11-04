@@ -32,6 +32,10 @@ export interface ChatMessage {
    * The active agent is a mid-conversation toggle (store.activeAgent), not a per-conversation
    * setting, so a single conversation can contain a mix of both. */
   agent?: "dementia" | "sloth";
+  /** Absolute path of the generated PNG, for messages made by image mode. */
+  image?: string;
+  /** The prompt that produced `image`, kept so Regenerate can redraw it. */
+  imagePrompt?: string;
 }
 
 export interface Conversation {

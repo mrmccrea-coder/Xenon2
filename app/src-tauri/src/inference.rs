@@ -699,6 +699,39 @@ pub async fn switch_model(
     Ok(name)
 }
 
+/// Runs `f` with the chat model unloaded, then reloads it. Used by image generation: the chat
+/// model and the image model can't both fit in a 4 GB GPU, so the chat model is freed for the
+/// duration. The engine lock is held throughout, so chat/extraction calls simply wait.
+/// Returns `f`'s result plus a reload error message if the chat model could not be restored
+/// (the caller still gets its result -- an image that was already made is not thrown away).
+/// Per-conversation cached state belongs to the dropped engine, so conversations rebuild it from
+/// history on their next turn, exactly as after `switch_model`.
+pub fn with_engine_unloaded<T>(
+    engine: &EngineState,
+    repo_root: &PathBuf,
+    f: impl FnOnce() -> T,
+) -> (T, Option<String>) {
+    let mut guard = match engine.0.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let was_loaded = guard.is_loaded();
+    let model_path = guard.model_path.clone();
+    if was_loaded {
+        *guard = EngineInner::empty(); // drops (frees) the model and its VRAM
+    }
+    let out = f();
+    let mut reload_error = None;
+    if was_loaded {
+        let vocab = vocab_path_for(repo_root);
+        match build_engine_inner(&model_path, &vocab) {
+            Ok((inner, _, _)) => *guard = inner,
+            Err(e) => reload_error = Some(format!("the chat model could not be reloaded: {e}")),
+        }
+    }
+    (out, reload_error)
+}
+
 fn last_error() -> String {
     unsafe {
         let ptr = ffi::xenon_get_last_error();
@@ -1255,7 +1288,7 @@ fn generate_blocking(
             engine,
             turn_state,
             suffix_c.as_ptr(),
-            200,  // max_tokens
+            600,  // max_tokens (raised from 200 on 2026-11-04: long replies were cut mid-sentence)
             0.8,  // temperature (matches Phase 1 CLI harness default)
             0.5,  // top_p (matches Phase 1 CLI harness default)
             // repeat_penalty (Phase 7 follow-up, 2026-08-02): added after real usage showed this

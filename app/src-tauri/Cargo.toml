@@ -27,3 +27,4 @@ chrono = "0.4"
 sysinfo = { version = "0.40", default-features = false, features = ["system", "disk"] }
 ureq = "3"
 sha2 = "0.10"
+base64 = "0.22"

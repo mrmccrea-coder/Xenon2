@@ -29,7 +29,17 @@
     "active": true,
     "targets": "all",
     "resources": {
-      "../../inference-engine/data/world_vocab.bin": "world_vocab.bin"
+      "../../inference-engine/data/world_vocab.bin": "world_vocab.bin",
+      "../../inference-engine/build-cuda-app/bin/Release/xenon_inference.dll": "xenon_inference.dll",
+      "../../inference-engine/build-cuda-app/bin/Release/rwkv.dll": "rwkv.dll",
+      "../../inference-engine/build-cuda-app/bin/Release/cublas64_13.dll": "cublas64_13.dll",
+      "../../inference-engine/build-cuda-app/bin/Release/cublasLt64_13.dll": "cublasLt64_13.dll",
+      "../../inference-engine/build-cuda-app/bin/Release/vcruntime140.dll": "vcruntime140.dll",
+      "../../inference-engine/build-cuda-app/bin/Release/vcruntime140_1.dll": "vcruntime140_1.dll",
+      "../../inference-engine/build-cuda-app/bin/Release/msvcp140.dll": "msvcp140.dll",
+      "../../inference-engine/build-cuda-app/bin/Release/msvcp140_1.dll": "msvcp140_1.dll",
+      "../../inference-engine/build-cuda-app/bin/Release/msvcp140_2.dll": "msvcp140_2.dll",
+      "../../inference-engine/build-cuda-app/bin/Release/concrt140.dll": "concrt140.dll"
     },
     "icon": [
       "icons/32x32.png",

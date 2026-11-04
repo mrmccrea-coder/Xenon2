@@ -232,6 +232,7 @@ onMounted(async () => {
   // Fresh install with no model: go straight to the setup screen instead of a dead chat.
   if (store.modelStatus && !store.modelStatus.ready) store.setupOpen = true;
   await store.loadDataDirSetting();
+  await store.refreshImageStatus();
   await store.restoreSession();
   scrollToBottom();
 

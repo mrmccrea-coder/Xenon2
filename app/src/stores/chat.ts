@@ -31,6 +31,7 @@
 
 import { defineStore } from "pinia";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type { Conversation, ChatMessage } from "../types";
 import { newId } from "../types";
 import {
@@ -125,6 +126,19 @@ interface ChatState {
   setupOpen: boolean;
   /** True while a model hot-swap is loading; the UI disables chat input for the duration. */
   switchingModel: boolean;
+
+  // --- Image generation (SDXL via stable-diffusion.cpp, see image.rs) ---
+  /** True when the engine and at least one image model are installed. */
+  imageAvailable: boolean;
+  /** Why image mode is unavailable (shown as a tooltip), if it is. */
+  imageReason: string | null;
+  imageModels: { file: string; label: string; sizeMb: number }[];
+  /** Image file name chosen for the next picture. */
+  imageModel: string | null;
+  /** Edge length in pixels of the next picture (512 / 768 / 1024). */
+  imageSize: number;
+  /** When on, the next sent message is drawn as a picture instead of answered as chat. */
+  imageMode: boolean;
 }
 
 export interface ModelOption {
@@ -228,6 +242,12 @@ export const useChatStore = defineStore("chat", {
     downloads: {},
     setupOpen: false,
     switchingModel: false,
+    imageAvailable: false,
+    imageReason: null,
+    imageModels: [],
+    imageModel: null,
+    imageSize: 768,
+    imageMode: false,
   }),
 
   getters: {
@@ -565,6 +585,10 @@ export const useChatStore = defineStore("chat", {
      * transcript rather than typed input. */
     async sendMessage(text: string, viaVoice = false): Promise<void> {
       if (this.generating) return;
+      if (this.imageMode && this.imageAvailable && !viaVoice) {
+        await this.sendImagePrompt(text);
+        return;
+      }
       this.currentTurnIsVoice = viaVoice;
       if (!this.activeConversation) {
         this.newChat();
@@ -643,6 +667,12 @@ export const useChatStore = defineStore("chat", {
       const idx = convo.messages.findIndex((m) => m.id === messageId);
       if (idx === -1 || convo.messages[idx].role !== "assistant") return;
 
+      // A picture is redrawn from its own prompt, not re-answered by the chat model.
+      if (convo.messages[idx].imagePrompt) {
+        await this.drawInto(convo.id, convo.messages[idx], convo.messages[idx].imagePrompt!);
+        return;
+      }
+
       const history = convo.messages
         .slice(0, idx)
         .map((m) => ({ role: m.role, content: m.content }));
@@ -713,6 +743,20 @@ export const useChatStore = defineStore("chat", {
           .replace(/\s*is there anything else[^.?!]*[.?!]?\s*$/i, "")
           .replace(/\s*how can i help you(?: today)?\??\s*$/i, "")
           .trimEnd();
+        // A long reply that hit the token limit stops mid-sentence ("...became the"). Cut it back
+        // to the last complete sentence, but only when that keeps most of the text so a short
+        // reply without end punctuation (e.g. "42" or a list) is never mangled.
+        if (msg.content.length > 800 && !/[.!?…"')\]]\s*$/.test(msg.content)) {
+          const cut = Math.max(
+            msg.content.lastIndexOf(". "),
+            msg.content.lastIndexOf("! "),
+            msg.content.lastIndexOf("? "),
+            msg.content.lastIndexOf(".\n"),
+            msg.content.lastIndexOf("!\n"),
+            msg.content.lastIndexOf("?\n")
+          );
+          if (cut > msg.content.length * 0.7) msg.content = msg.content.slice(0, cut + 1).trimEnd();
+        }
       }
       delete this.streamingMessageIds[conversationId];
       this.generating = false;
@@ -828,6 +872,95 @@ export const useChatStore = defineStore("chat", {
     },
 
     // --- Phase 7 follow-up: Dementia/Sloth agent toggle + Sloth's persistent memory ---
+
+    // --- Image generation ---
+
+    /** Checks whether the image engine + a model are installed. Called once at startup. */
+    async refreshImageStatus(): Promise<void> {
+      try {
+        const s = await invoke<{
+          available: boolean;
+          reason: string | null;
+          models: { file: string; label: string; sizeMb: number }[];
+          sizes: number[];
+        }>("image_status");
+        this.imageAvailable = s.available;
+        this.imageReason = s.reason;
+        this.imageModels = s.models;
+        if (!this.imageModel || !s.models.some((m) => m.file === this.imageModel)) {
+          this.imageModel = s.models[0]?.file ?? null;
+        }
+        if (!s.available) this.imageMode = false;
+      } catch (err) {
+        console.warn("[chat store] image_status failed:", err);
+        this.imageAvailable = false;
+        this.imageReason = String(err);
+      }
+    },
+
+    setImageMode(on: boolean): void {
+      this.imageMode = on && this.imageAvailable;
+    },
+
+    /** Draws `prompt` into `assistantMsg` (new or being regenerated). Chat is blocked for the
+     * duration: `generating` stays true, and the backend holds the engine lock. */
+    async drawInto(conversationId: string, assistantMsg: ChatMessage, prompt: string): Promise<void> {
+      this.generating = true;
+      this.backendError = null;
+      assistantMsg.streaming = true;
+      assistantMsg.errored = false;
+      assistantMsg.image = undefined;
+      assistantMsg.imagePrompt = undefined;
+      assistantMsg.content = "Drawing...";
+      assistantMsg.timestamp = Date.now();
+
+      const unlisten = await listen<string>("image-stage", (e) => {
+        assistantMsg.content = e.payload;
+      });
+      try {
+        const r = await invoke<{ path: string; seed: number; secs: number; warning: string | null }>(
+          "generate_image",
+          { prompt, model: this.imageModel, size: this.imageSize }
+        );
+        assistantMsg.image = r.path;
+        assistantMsg.imagePrompt = prompt;
+        // What the chat model sees of this turn in later history.
+        assistantMsg.content = `(Drew an image of: ${prompt})`;
+        assistantMsg.streaming = false;
+        if (r.warning) this.backendError = r.warning;
+        void this.autoSave(conversationId);
+      } catch (err) {
+        assistantMsg.streaming = false;
+        assistantMsg.errored = true;
+        assistantMsg.content = `(image failed: ${String(err)})`;
+        this.backendError = String(err);
+      } finally {
+        unlisten();
+        this.generating = false;
+      }
+    },
+
+    /** Image-mode send: the text is a picture description, not a chat message. */
+    async sendImagePrompt(text: string): Promise<void> {
+      if (this.generating) return;
+      if (!this.activeConversation) this.newChat();
+      const convo = this.activeConversation!;
+      if (convo.title === "New Chat" || !convo.title) {
+        convo.title = text.length > 40 ? text.slice(0, 40) + "..." : text;
+      }
+      convo.messages.push({ id: newId(), role: "user", content: `/image ${text}`, timestamp: Date.now() });
+      const assistantMsg: ChatMessage = {
+        id: newId(),
+        role: "assistant",
+        content: "Drawing...",
+        streaming: true,
+        timestamp: Date.now(),
+      };
+      convo.messages.push(assistantMsg);
+      // Re-read through the reactive array so later mutations are seen by the UI.
+      const reactiveMsg = convo.messages[convo.messages.length - 1];
+      await this.drawInto(convo.id, reactiveMsg, text);
+    },
 
     /** Flips which agent the *next* generation call uses (see `activeAgent`'s doc comment). */
     setActiveAgent(agent: "dementia" | "sloth"): void {

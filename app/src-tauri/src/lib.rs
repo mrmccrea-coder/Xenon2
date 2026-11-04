@@ -1,5 +1,6 @@
 mod ffi;
 mod hardware;
+mod image;
 mod inference;
 mod memory;
 mod models_dl;
@@ -166,6 +167,9 @@ pub fn run() {
             inference::switch_model,
             inference::get_model_status,
             inference::get_hardware_report,
+            image::image_status,
+            image::generate_image,
+            image::read_image,
             models_dl::download_model,
             models_dl::cancel_model_download,
             persistence::save_conversation_file,

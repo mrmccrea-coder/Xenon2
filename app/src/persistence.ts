@@ -21,6 +21,8 @@ export interface ConversationFileMessage {
   timestamp: number;
   edited?: boolean;
   agent?: "dementia" | "sloth";
+  image?: string;
+  imagePrompt?: string;
 }
 
 export interface ConversationFile {
@@ -60,6 +62,8 @@ export function toConversationFile(convo: Conversation, fallbackModel: string): 
       };
       if (m.edited) out.edited = true;
       if (m.agent) out.agent = m.agent;
+      if (m.image) out.image = m.image;
+      if (m.imagePrompt) out.imagePrompt = m.imagePrompt;
       return out;
     }),
   };
@@ -82,6 +86,8 @@ export function fromConversationFile(file: ConversationFile): Conversation {
         timestamp: m.timestamp,
         edited: m.edited,
         agent: m.agent,
+        image: m.image,
+        imagePrompt: m.imagePrompt,
       })
     ),
   };

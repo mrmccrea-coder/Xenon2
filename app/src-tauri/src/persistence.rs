@@ -46,6 +46,13 @@ pub struct ConversationFileMessage {
     /// on user messages and on any message saved before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// Absolute path of a generated PNG (assistant messages made by image mode only), and the
+    /// prompt that made it, so Regenerate can redraw it. Absent on every other message and on
+    /// files saved before image generation existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "imagePrompt")]
+    pub image_prompt: Option<String>,
 }
 
 /// The full on-disk shape of one saved conversation. Mirrors `SCHEMA.md` field-for-field.
