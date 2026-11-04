@@ -5,6 +5,7 @@
 #include "rwkv.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -13,6 +14,7 @@
 #include <numeric>
 #include <random>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #ifndef XENON_HAS_CUDA
@@ -67,15 +69,14 @@ size_t utf8_safe_prefix_len(const std::string & buf) {
 // recomputed from a full prompt every time; see xenon_inference.h's xenon_state docs).
 constexpr size_t STATE_RECENT_TOKENS_CAP = REPEAT_PENALTY_WINDOW;
 
-// How many trailing tokens xenon_state keeps for the copy guard (see block_repeated_ngrams). Much
-// larger than the repeat-penalty window on purpose: the penalty only needs to cover a canned
-// phrase a turn or two back, but the copy guard has to reach back over a whole previous reply --
-// with replies now allowed to run to hundreds of tokens, the start of the previous reply is well
-// outside a 256-token window by the time the next one begins (that is exactly how the model got
-// stuck re-emitting its previous long reply word for word, 2026-11-04). A trailing slack is kept
-// so the buffer is trimmed in occasional chunks rather than shifted on every token.
-constexpr size_t STATE_HISTORY_CAP = 4096;
-constexpr size_t STATE_HISTORY_SLACK = 512;
+// How much trailing *text* xenon_state keeps for the copy guard (see block_copy). Much larger than
+// the repeat-penalty window on purpose: the penalty only needs to cover a canned phrase a turn or
+// two back, but the copy guard has to reach back over whole previous replies -- with replies now
+// allowed to run long, the start of the previous reply is far outside a 256-token window by the
+// time the next one begins (that is how the model got stuck re-emitting its previous reply word
+// for word, 2026-11-04). ~16k characters is several long replies. Trimmed in chunks via the slack.
+constexpr size_t STATE_HISTORY_TEXT_CAP = 16384;
+constexpr size_t STATE_HISTORY_TEXT_SLACK = 2048;
 
 } // namespace
 
@@ -90,19 +91,20 @@ struct xenon_state {
     // prompt like the old per-call `recent_tokens` local) so repeat-penalty behavior under
     // incremental prefill is identical to a full re-feed every time -- see xenon_prefill.
     std::vector<uint32_t> recent_tokens;
-    // Longer rolling window (STATE_HISTORY_CAP) of the same tokens, in feed order, used only by
-    // the copy guard. See block_repeated_ngrams.
-    std::vector<uint32_t> history;
+    // The decoded text of everything fed into or generated from this state (the last
+    // STATE_HISTORY_TEXT_CAP bytes), used only by the copy guard. Text rather than token ids on
+    // purpose: the same words can be split into tokens in different ways, and a token-level guard
+    // let the model copy a 99-character run simply by splitting it differently. See block_copy.
+    std::string history_text;
 };
 
 struct xenon_engine {
     rwkv_context * ctx = nullptr;
     std::unique_ptr<WorldTokenizer> tokenizer;
 
-    // Copy guard setting: 0 = off (the default, so every other caller behaves exactly as before);
-    // n >= 2 forbids generating any token that would complete a run of n tokens identical to one
-    // already in the state's history. Set per use via xenon_set_no_repeat_ngram.
-    uint32_t no_repeat_ngram = 0;
+    // Copy guard setting, in characters: 0 = off (the default, so every other caller behaves
+    // exactly as before). Set per use via xenon_set_copy_guard. See block_copy.
+    uint32_t copy_guard_chars = 0;
 
     size_t n_vocab = 0;
     size_t n_layer = 0;
@@ -124,66 +126,88 @@ struct xenon_engine {
 
 namespace {
 
-void push_recent_tokens(xenon_state * state, const uint32_t * tokens, size_t count) {
+void push_recent_tokens(const xenon_engine * engine, xenon_state * state, const uint32_t * tokens, size_t count) {
     state->recent_tokens.insert(state->recent_tokens.end(), tokens, tokens + count);
     size_t n = state->recent_tokens.size();
     if (n > STATE_RECENT_TOKENS_CAP) {
         state->recent_tokens.erase(state->recent_tokens.begin(), state->recent_tokens.begin() + (n - STATE_RECENT_TOKENS_CAP));
     }
 
-    state->history.insert(state->history.end(), tokens, tokens + count);
-    size_t h = state->history.size();
-    if (h > STATE_HISTORY_CAP + STATE_HISTORY_SLACK) {
-        state->history.erase(state->history.begin(), state->history.begin() + (h - STATE_HISTORY_CAP));
+    for (size_t i = 0; i < count; i++) {
+        state->history_text += engine->tokenizer->decode_token(tokens[i]);
+    }
+    size_t h = state->history_text.size();
+    if (h > STATE_HISTORY_TEXT_CAP + STATE_HISTORY_TEXT_SLACK) {
+        state->history_text.erase(0, h - STATE_HISTORY_TEXT_CAP);
     }
 }
 
-// Copy guard: forbids the next token from completing an n-token run that already appears earlier
-// in `history`, by pushing that token's logit far down (not -inf, so the penalty arithmetic
-// elsewhere can't produce NaN). This is the standard "no repeat n-gram" rule. It exists because
-// the repeat penalty is a soft nudge over a short window: a small model that is copying its own
-// earlier long reply has a far stronger pull than that, and it re-emitted the previous reply word
-// for word on every follow-up ("write a different story", "add to the story") -- three
-// byte-identical replies in a row. Banning verbatim runs breaks the copy within n tokens and
-// forces it to continue from the new request instead. A run of n tokens (n ~ 8, roughly six
-// words) is long enough that ordinary reuse of a name or a short phrase is never affected.
-// Cost: one pass over at most STATE_HISTORY_CAP + SLACK tokens per generated token, a rounding
-// error next to the O(n_vocab) sampling pass.
+// Copy guard. If the last `min_chars` characters of the reply being generated already appear
+// earlier in the conversation, every token that would carry on copying from there is pushed far
+// down (not -inf, so the penalty arithmetic elsewhere can't produce NaN) -- every token whose text
+// agrees with what came next in the earlier occurrence, so the copy can't continue however the
+// words are split into tokens.
 //
-// `generated` is how many tokens the current reply has produced so far. The run being matched
-// must lie wholly inside the reply being generated, never in the prompt: otherwise asking the same
-// question twice would make the identical prompt tokens match an earlier occurrence and forbid
-// the very answer given last time (repeating "what is 6 times 7?" could not answer 42 again).
-// Returns true if anything was banned, i.e. the model was caught mid-copy (see run_generation_loop,
-// which then tightens the guard for the rest of the reply).
-bool block_repeated_ngrams(float * logits, size_t n_vocab, const std::vector<uint32_t> & history, size_t n, size_t generated) {
-    if (n < 2 || history.size() < n) return false;
-    const size_t m = n - 1;                    // length of the suffix we match against
-    if (generated < m) return false;           // suffix would reach back into the prompt
+// Why: the repeat penalty is a soft nudge over a short window. A small model copying its own
+// earlier reply has a far stronger pull than that; it re-emitted its previous reply word for word
+// on follow-ups ("write another story", "tell me more") -- byte-identical replies in a row. A
+// token-level version of this guard was beaten by the model copying the same text with a different
+// token split (a 99-character verbatim run got through), and pushed it into misspellings
+// ("goormet") by banning one spelling of a word but not the others. Matching text fixes both.
+//
+// Rules that keep it from getting in the way:
+// - `generated_bytes`: the matched run must lie wholly inside the reply being written, never in the
+//   prompt, so asking the same question twice can still get the same answer.
+// - Runs made only of digits, punctuation and spaces may repeat (counting, dates, lists of numbers).
+// - `min_chars` (~48, about ten tokens) is long enough that names and short phrases are never
+//   affected; only real copying is.
+// Cost: a substring search of the history text per token, plus -- only while a copy is actually
+// being attempted -- one pass over the vocabulary comparing first bytes. Well under a millisecond.
+// Returns true if anything was banned (a copy attempt was caught).
+bool block_copy(const xenon_engine * engine, float * logits, const std::string & hist, size_t min_chars, size_t generated_bytes) {
+    if (min_chars == 0 || generated_bytes < min_chars || hist.size() <= min_chars) return false;
+    const size_t len = hist.size();
+    const std::string_view h(hist);
+    const std::string_view suffix = h.substr(len - min_chars);
+
+    bool has_letters = false;
+    for (unsigned char c : suffix) {
+        if (std::isalpha(c) || c >= 0x80) { has_letters = true; break; }
+    }
+    if (!has_letters) return false;
+
+    // Where the same run occurred before, and what followed it each time. The run's own position
+    // at the very end (len - min_chars) is excluded by the loop bound.
+    std::vector<std::string_view> continuations;
+    for (size_t pos = h.find(suffix); pos != std::string_view::npos && pos < len - min_chars; pos = h.find(suffix, pos + 1)) {
+        const size_t next = pos + min_chars;
+        continuations.push_back(h.substr(next, std::min<size_t>(32, len - next)));
+        if (continuations.size() >= 16) break;
+    }
+    if (continuations.empty()) return false;
+
     bool banned_any = false;
-    const size_t len = history.size();
-    const uint32_t * suffix = history.data() + (len - m);
-    // i + m < len: history[i + m] must exist and the suffix itself (i == len - m) is excluded.
-    for (size_t i = 0; i + m < len; i++) {
-        if (history[i] != suffix[0]) continue;
-        size_t k = 1;
-        while (k < m && history[i + k] == suffix[k]) k++;
-        if (k == m) {
-            const uint32_t banned = history[i + m];
-            if (banned < n_vocab) {
-                logits[banned] = -1.0e9f;
+    for (size_t t = 0; t < engine->n_vocab; t++) {
+        const std::string & text = engine->tokenizer->decode_token(static_cast<uint32_t>(t));
+        if (text.empty()) continue;
+        for (const std::string_view & c : continuations) {
+            const size_t m = std::min(text.size(), c.size());
+            if (m > 0 && text[0] == c[0] && text.compare(0, m, c.data(), m) == 0) {
+                logits[t] = -1.0e9f;
                 banned_any = true;
+                break;
             }
         }
     }
     return banned_any;
 }
 
-// Once the guard has caught a copy attempt, the rest of that reply is checked with this much
-// shorter run length. Seen in the app: a model set on copying can dodge a 10-token ban by slipping
-// in filler ("dense, moonlit ... ... ... forest, where the leaves whispered...") and then carrying
-// on copying. Normal replies never trigger the first ban, so they never see this stricter setting.
-constexpr size_t COPY_GUARD_ESCALATED_N = 5;
+// After this many caught attempts in one reply the model is stuck: end the reply cleanly rather
+// than let it be forced into ever stranger text (seen: whole sentences written backwards). There
+// is deliberately no "stricter after the first catch" mode any more: a 24-character version of it
+// caught ordinary phrasing ("Without hesitation, Dragonfly") and pushed the model into junk text;
+// the give-up limit already deals with a model that keeps trying to copy.
+constexpr size_t COPY_GUARD_GIVE_UP_AFTER = 6;
 
 // Shared by xenon_prefill and xenon_generate_with_state's initial-prompt step: encode `text` and
 // evaluate it into `state` (state_in == state_out == state->state.data()), updating cached
@@ -226,7 +250,7 @@ bool eval_text_into_state(
         return false;
     }
 
-    push_recent_tokens(state, tokens.data(), tokens.size());
+    push_recent_tokens(engine, state, tokens.data(), tokens.size());
     *out_token_count = tokens.size();
 
     // Phase 8 measurement instrumentation: prints the actual number of tokens evaluated on this
@@ -256,20 +280,27 @@ xenon_status run_generation_loop(
 ) {
     std::string pending_utf8; // holds back incomplete multi-byte UTF-8 sequences
 
-    size_t guard_n = engine->no_repeat_ngram; // tightened below once a copy attempt is caught
+    const size_t guard_chars = engine->copy_guard_chars;
+    size_t catches = 0;
+    size_t generated_bytes = 0;
     for (int i = 0; i < max_tokens; i++) {
-        if (guard_n >= 2) {
-            bool caught = block_repeated_ngrams(state->logits.data(), engine->n_vocab, state->history, guard_n, static_cast<size_t>(i));
-            if (caught && guard_n > COPY_GUARD_ESCALATED_N) guard_n = COPY_GUARD_ESCALATED_N;
+        if (guard_chars > 0) {
+            if (block_copy(engine, state->logits.data(), state->history_text, guard_chars, generated_bytes)) {
+                catches++;
+                if (catches >= COPY_GUARD_GIVE_UP_AFTER) {
+                    break; // stuck on copying: end the reply here (pending bytes flushed below)
+                }
+            }
         }
         uint32_t token = xenon_sample_logits(
             state->logits.data(), engine->n_vocab, temperature, top_p,
             repeat_penalty, state->recent_tokens, engine->rng
         );
 
-        push_recent_tokens(state, &token, 1);
+        push_recent_tokens(engine, state, &token, 1);
 
         const std::string & token_bytes = engine->tokenizer->decode_token(token);
+        generated_bytes += token_bytes.size();
         pending_utf8 += token_bytes;
 
         size_t safe_len = utf8_safe_prefix_len(pending_utf8);
@@ -397,7 +428,7 @@ XENON_API void xenon_state_copy(xenon_state * dst, const xenon_state * src) {
     dst->state = src->state;
     dst->logits = src->logits;
     dst->recent_tokens = src->recent_tokens;
-    dst->history = src->history;
+    dst->history_text = src->history_text;
 }
 
 XENON_API void xenon_state_reset(xenon_engine * engine, xenon_state * state) {
@@ -405,12 +436,12 @@ XENON_API void xenon_state_reset(xenon_engine * engine, xenon_state * state) {
     rwkv_init_state(engine->ctx, state->state.data());
     std::fill(state->logits.begin(), state->logits.end(), 0.0f);
     state->recent_tokens.clear();
-    state->history.clear();
+    state->history_text.clear();
 }
 
-XENON_API void xenon_set_no_repeat_ngram(xenon_engine * engine, uint32_t n) {
+XENON_API void xenon_set_copy_guard(xenon_engine * engine, uint32_t min_chars) {
     if (!engine) return;
-    engine->no_repeat_ngram = (n >= 2) ? n : 0;
+    engine->copy_guard_chars = min_chars;
 }
 
 XENON_API xenon_status xenon_prefill(

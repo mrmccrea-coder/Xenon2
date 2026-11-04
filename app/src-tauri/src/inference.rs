@@ -848,13 +848,13 @@ fn volatile_header_text(facts: &[sloth_memory::SlothFact], include_clock: bool) 
     out
 }
 
-/// Chat replies may not complete a run of this many tokens (about six words) that already appears
-/// earlier in the conversation. Added 2026-11-04: once replies could run long, the model began
-/// answering follow-ups ("write a different story", "add to the story") by re-emitting its
-/// previous long reply word for word -- three byte-identical replies in a row -- because the
-/// repeat penalty only looks back 256 tokens and the start of the old reply was outside that.
-/// Short runs (names, a few repeated words) are unaffected; only real copying is blocked.
-const COPY_GUARD_NGRAM: u32 = 10;
+/// Chat replies may not carry on copying a run of this many characters (about ten tokens) that
+/// already appears earlier in the conversation or earlier in the same reply -- see the engine's
+/// `xenon_set_copy_guard`. Added 2026-11-04 after the model answered follow-ups ("write another
+/// story", "tell me more") by re-emitting an earlier reply word for word, and looped inside a
+/// single reply ("banana banana banana..." 2,999 times). Names and short phrases are unaffected;
+/// runs of only digits and punctuation (counting, dates) are allowed to repeat.
+const COPY_GUARD_CHARS: u32 = 48;
 
 /// Lower-cased, whitespace-collapsed, trailing-punctuation-free form of a message, so "What is
 /// 6 times 7?" and "what is 6 times 7" count as the same question.
@@ -863,14 +863,6 @@ fn normalize_question(s: &str) -> String {
     let collapsed = lower.split_whitespace().collect::<Vec<_>>().join(" ");
     collapsed.trim_end_matches(|c: char| c.is_ascii_punctuation() || c.is_whitespace()).to_string()
 }
-
-/// Earlier replies at least this long (characters; about 140 tokens) can fall outside the repeat
-/// penalty's 256-token window by the time the next reply starts, which is the only situation in
-/// which the model can copy one back word for word. Shorter replies are covered by the penalty
-/// alone, so the guard stays off for them and cannot disturb short repeated answers -- a count, a
-/// list, a one-line fact. (Measured: with the guard always on, asking for "count from one to ten"
-/// a second time, reworded, came back cut off as "1, 2, 3, 4, 5...".)
-const COPY_GUARD_MIN_PRIOR_REPLY_CHARS: usize = 600;
 
 /// True for messages that carry code: repeating long runs of text exactly is correct there.
 fn looks_like_code(s: &str) -> bool {
@@ -884,10 +876,21 @@ fn looks_like_code(s: &str) -> bool {
             >= 3
 }
 
-/// How the copy guard should be set for this turn: `COPY_GUARD_NGRAM`, or 0 (off). It is on only
-/// when a long earlier reply exists that could be copied back, and off whenever producing
-/// identical text is what the user wants: they asked the very same question again, asked for
-/// something to be repeated or quoted, or sent code.
+/// "say banana 30 times", "write hello 5 times": the user asked for repetition.
+/// "6 times 7" is multiplication, so a number straight after "times" means it isn't repetition.
+fn asks_for_repetition(lower: &str) -> bool {
+    let words: Vec<&str> = lower.split_whitespace().map(|w| w.trim_end_matches(['.', '?', '!', ','])).collect();
+    (0..words.len().saturating_sub(1)).any(|i| {
+        words[i].parse::<u32>().is_ok()
+            && words[i + 1] == "times"
+            && words.get(i + 2).is_none_or(|next| next.parse::<f64>().is_err())
+    })
+}
+
+/// How the copy guard should be set for this turn: `COPY_GUARD_CHARS`, or 0 (off). On by default
+/// -- short replies get copied too (testing showed "tell me more" answered with the same 29 words
+/// four times) -- and off whenever identical text is what the user wants: the very same question
+/// again, a request to repeat, quote or retell "the same" thing, "say X N times", or code.
 fn copy_guard_for(prior_turns: &[ChatTurn], new_text: &str) -> u32 {
     let lower = new_text.to_lowercase();
     const EXACT_REQUESTS: [&str; 8] = [
@@ -897,17 +900,19 @@ fn copy_guard_for(prior_turns: &[ChatTurn], new_text: &str) -> u32 {
     if EXACT_REQUESTS.iter().any(|p| lower.contains(p)) || looks_like_code(new_text) {
         return 0;
     }
+    if (lower.contains("the same") && lower.contains("again")) || asks_for_repetition(&lower) {
+        return 0;
+    }
+    // The same question again may get the same answer -- but "tell me more", typed twice, is asking
+    // for something *new* each time (testing: it got the same 17 words three times in a row).
+    const ASKS_FOR_MORE: [&str; 9] =
+        ["more", "continue", "keep going", "go on", "and then", "what else", "next", "another", "again"];
     let q = normalize_question(new_text);
-    if !q.is_empty() && prior_turns.iter().any(|t| t.role == "user" && normalize_question(&t.content) == q) {
+    let wants_new = ASKS_FOR_MORE.iter().any(|p| q.contains(p));
+    if !q.is_empty() && !wants_new && prior_turns.iter().any(|t| t.role == "user" && normalize_question(&t.content) == q) {
         return 0;
     }
-    let has_long_reply = prior_turns
-        .iter()
-        .any(|t| t.role == "assistant" && t.content.chars().count() >= COPY_GUARD_MIN_PRIOR_REPLY_CHARS);
-    if !has_long_reply {
-        return 0;
-    }
-    COPY_GUARD_NGRAM
+    COPY_GUARD_CHARS
 }
 
 /// Hard bounds on a reply, whatever the UI sends.
@@ -920,18 +925,21 @@ const MAX_REPLY_TOKENS: u32 = 3000;
 /// long budget, and everything else a modest one. Short answers still stop on their own, so a
 /// bigger cap never slows a short reply down -- it only matters for replies that run long.
 fn resolve_max_tokens(requested: Option<u32>, user_text: &str) -> u32 {
-    if let Some(n) = requested.filter(|n| *n > 0) {
-        return n.clamp(MIN_REPLY_TOKENS, MAX_REPLY_TOKENS);
-    }
     let lower = user_text.to_lowercase();
     let words: Vec<&str> = lower.split(|c: char| !(c.is_alphanumeric())).filter(|w| !w.is_empty()).collect();
     // "400 word story", "400-word", "400 words"
-    for pair in words.windows(2) {
-        if let Ok(n) = pair[0].parse::<u32>() {
-            if pair[1] == "word" || pair[1] == "words" {
-                return (n.saturating_mul(3) / 2 + 80).clamp(150, 2000);
-            }
-        }
+    let asked_length = words.windows(2).find_map(|pair| {
+        let n = pair[0].parse::<u32>().ok()?;
+        (pair[1] == "word" || pair[1] == "words").then(|| (n.saturating_mul(3) / 2 + 80).clamp(150, 2000))
+    });
+    if let Some(n) = requested.filter(|n| *n > 0) {
+        let manual = n.clamp(MIN_REPLY_TOKENS, MAX_REPLY_TOKENS);
+        // The manual setting is a ceiling, not a target: when the request names a length, that is
+        // the better limit. (On Max, "a 400 word story" ran to 1,750 rambling, repetitive words.)
+        return asked_length.map_or(manual, |a| a.min(manual));
+    }
+    if let Some(a) = asked_length {
+        return a;
     }
     const LONG_FORM: [&str; 12] = [
         "story", "essay", "article", "poem", "explain", "describe", "tutorial", "detailed",
@@ -961,15 +969,15 @@ fn mentions_time_or_date(user_text: &str) -> bool {
 
 /// True once the model starts writing a turn of its own instead of finishing Xenon's reply. A role
 /// label at the start of a line ("\n\nUser:", "\nAssistant:") always counts; so does one glued
-/// straight onto the end of a word or sentence ("...the young foxUser: How do I...", seen in
-/// testing 2026-11-04 -- the model's escape hatch when the copy guard stops it copying). A label
-/// after a space ("as the User: field shows") is ordinary text and does not.
+/// straight onto whatever came before it -- a word ("...the young foxUser: How do I..."), a
+/// sentence end, or a stray symbol ("Dragon✿text1✿User:"), all seen in testing 2026-11-04 as the
+/// model's escape hatches. Only a label after a space ("the box labelled User:") is ordinary text.
 fn ends_with_stop(tail: &str) -> bool {
     const LABELS: [&str; 5] = ["User:", "user:", "Assistant:", "assistant:", "Xenon:"];
     LABELS.iter().any(|label| match tail.strip_suffix(label) {
         Some(before) => match before.chars().last() {
             None => false, // label alone with nothing before it in the tail window: can't tell
-            Some(c) => c == '\n' || c.is_alphanumeric() || ".!?\"')".contains(c),
+            Some(c) => c == '\n' || !c.is_whitespace(),
         },
         None => false,
     })
@@ -1046,9 +1054,31 @@ extern "C" fn on_token(
         if ends_with_stop(&tail) {
             return false; // natural end of this turn, matches the CLI harness's stop heuristic
         }
+        drop(tail);
+        if stuck_repeating(&ctx.full_text.borrow()) {
+            return false; // the same short pattern over and over: the reply is stuck, end it
+        }
     }
 
     true
+}
+
+/// How much of the end of a reply must be one short pattern on repeat before it counts as stuck,
+/// and the longest pattern looked for. 600 characters lets an asked-for repetition through ("say
+/// banana 30 times" is 210 characters) but stops a runaway: in testing that request went on to
+/// say "banana" 2,999 times, until the reply-length limit ended it minutes later.
+const STUCK_WINDOW: usize = 600;
+const STUCK_MAX_PERIOD: usize = 80;
+
+/// True when the last `STUCK_WINDOW` bytes of `text` are a pattern of at most `STUCK_MAX_PERIOD`
+/// bytes repeating exactly ("banana banana banana ...", "ha ha ha ...", "!!!!!!...").
+fn stuck_repeating(text: &str) -> bool {
+    let b = text.as_bytes();
+    if b.len() < STUCK_WINDOW {
+        return false;
+    }
+    let tail = &b[b.len() - STUCK_WINDOW..];
+    (1..=STUCK_MAX_PERIOD).any(|p| tail[p..] == tail[..STUCK_WINDOW - p])
 }
 
 /// Minimal callback for the Sloth fact-extraction call -- just accumulates text into `user_data`
@@ -1146,7 +1176,7 @@ fn run_fact_extraction(
     // Extraction deliberately copies phrases out of the user's message ("likes power metal
     // music"), so the copy guard must be off here. The engine setting is shared and calls are
     // serialized by the engine lock, so every generation sets it explicitly.
-    unsafe { ffi::xenon_set_no_repeat_ngram(engine, 0) };
+    unsafe { ffi::xenon_set_copy_guard(engine, 0) };
 
     let buf = RefCell::new(String::new());
     let buf_ptr = &buf as *const RefCell<String> as *mut c_void;
@@ -1444,8 +1474,8 @@ fn generate_blocking(
     };
     let ctx_ptr = &ctx as *const CallbackCtx as *mut c_void;
 
-    // Copy guard (see COPY_GUARD_NGRAM): keeps the model from re-emitting an earlier reply.
-    unsafe { ffi::xenon_set_no_repeat_ngram(engine, copy_guard_for(prior_turns, &new_user_turn.content)) };
+    // Copy guard (see COPY_GUARD_CHARS): keeps the model from re-emitting earlier text.
+    unsafe { ffi::xenon_set_copy_guard(engine, copy_guard_for(prior_turns, &new_user_turn.content)) };
     let status = unsafe {
         ffi::xenon_generate_with_state(
             engine,
@@ -1585,6 +1615,7 @@ mod stop_tests {
 
     #[test]
     fn a_turn_glued_onto_the_reply_stops() {
+        assert!(ends_with_stop("Without hesitation, Dragon\u{273f}text1\u{273f}User:"));
         assert!(ends_with_stop("As the night wore on, the young foxUser:"));
         assert!(ends_with_stop("they all went home.User:"));
         assert!(ends_with_stop("he said \"goodbye\"Assistant:"));
@@ -1607,32 +1638,38 @@ mod copy_guard_tests {
         ChatTurn { role: role.to_string(), content: content.to_string() }
     }
 
-    /// A reply long enough (> COPY_GUARD_MIN_PRIOR_REPLY_CHARS) to be copied back by the model.
     fn long_reply() -> String {
         "Once upon a time, in a dense forest, a fox found a lantern. ".repeat(14)
     }
 
     #[test]
-    fn guard_is_on_for_a_new_request_after_a_long_reply() {
+    fn guard_is_on_for_new_requests_after_long_and_short_replies() {
         let long = long_reply();
-        assert!(long.chars().count() >= COPY_GUARD_MIN_PRIOR_REPLY_CHARS);
         let prior = [turn("user", "Write a story about a fox"), turn("assistant", &long)];
-        assert_eq!(copy_guard_for(&prior, "write a story of how the fox brings his friends"), COPY_GUARD_NGRAM);
-        assert_eq!(copy_guard_for(&prior, "add to the story"), COPY_GUARD_NGRAM);
-        // an older long reply still counts later in the conversation
-        let later = [
-            turn("user", "Write a story"), turn("assistant", &long),
-            turn("user", "thanks"), turn("assistant", "You're welcome."),
+        assert_eq!(copy_guard_for(&prior, "write a story of how the fox brings his friends"), COPY_GUARD_CHARS);
+        assert_eq!(copy_guard_for(&prior, "add to the story"), COPY_GUARD_CHARS);
+        // Short replies get copied too ("tell me more" x4 -> the same 29 words four times)
+        let short = [turn("user", "Tell me about the moon."), turn("assistant", "The moon is Earth's only natural satellite.")];
+        assert_eq!(copy_guard_for(&short, "tell me more"), COPY_GUARD_CHARS);
+        // "tell me more" typed again is still a request for something new, not a repeated question
+        let again = [
+            turn("user", "Tell me about the moon."), turn("assistant", "The moon is Earth's only natural satellite."),
+            turn("user", "tell me more"), turn("assistant", "The moon has no atmosphere."),
         ];
-        assert_eq!(copy_guard_for(&later, "write another one"), COPY_GUARD_NGRAM);
+        assert_eq!(copy_guard_for(&again, "tell me more"), COPY_GUARD_CHARS);
+        assert_eq!(copy_guard_for(&again, "Tell me more!"), COPY_GUARD_CHARS);
+        // and loops can start inside the very first reply
+        assert_eq!(copy_guard_for(&[], "Hello"), COPY_GUARD_CHARS);
     }
 
     #[test]
-    fn guard_is_off_when_no_long_reply_exists() {
-        // The measured regression: reworded counting after only short replies was cut to "1, 2, 3, 4, 5...".
-        assert_eq!(copy_guard_for(&[], "Hello"), 0);
-        let prior = [turn("user", "Count from 1 to 10."), turn("assistant", "1, 2, 3, 4, 5, 6, 7, 8, 9, 10.")];
-        assert_eq!(copy_guard_for(&prior, "Please count from one up to ten for me."), 0);
+    fn guard_is_off_when_repetition_is_asked_for() {
+        assert_eq!(copy_guard_for(&[], "Say the word banana 30 times."), 0);
+        assert_eq!(copy_guard_for(&[], "write hello 5 times"), 0);
+        assert_eq!(copy_guard_for(&[], "what is 6 times 7"), COPY_GUARD_CHARS, "'times' as multiplication is not repetition");
+        let prior = [turn("user", "Tell me a story"), turn("assistant", &long_reply())];
+        assert_eq!(copy_guard_for(&prior, "Tell me the same story again but change the robot's name to Max."), 0);
+        assert_eq!(copy_guard_for(&prior, "Tell me another story but change the name."), COPY_GUARD_CHARS);
     }
 
     #[test]
@@ -1641,7 +1678,7 @@ mod copy_guard_tests {
         let prior = [turn("user", "What is 6 times 7?"), turn("assistant", "42"), turn("user", "Write a story"), turn("assistant", &long)];
         assert_eq!(copy_guard_for(&prior, "what is 6 times 7"), 0, "case and trailing punctuation don't matter");
         assert_eq!(copy_guard_for(&prior, "  What is   6 times 7 ?! "), 0);
-        assert_eq!(copy_guard_for(&prior, "What is 6 times 8?"), COPY_GUARD_NGRAM, "a different question is guarded");
+        assert_eq!(copy_guard_for(&prior, "What is 6 times 8?"), COPY_GUARD_CHARS, "a different question is guarded");
     }
 
     #[test]
@@ -1652,7 +1689,7 @@ mod copy_guard_tests {
         assert_eq!(copy_guard_for(&prior, "say it again"), 0);
         assert_eq!(copy_guard_for(&prior, "give me that word for word"), 0);
         assert_eq!(copy_guard_for(&prior, "quote the first line"), 0);
-        assert_eq!(copy_guard_for(&prior, "tell me another story"), COPY_GUARD_NGRAM);
+        assert_eq!(copy_guard_for(&prior, "tell me another story"), COPY_GUARD_CHARS);
     }
 
     #[test]
@@ -1661,13 +1698,45 @@ mod copy_guard_tests {
         let prior = [turn("user", "Tell me a story"), turn("assistant", &long)];
         assert_eq!(copy_guard_for(&prior, "fix this:\n```java\nint x = 1;\n```"), 0);
         assert_eq!(copy_guard_for(&prior, "why does\nint a = 1;\nint b = 2;\nint c = 3;\nfail?"), 0);
-        assert_eq!(copy_guard_for(&prior, "Write a story about a coder; a lonely one; a kind one."), COPY_GUARD_NGRAM, "prose with semicolons is not code");
+        assert_eq!(copy_guard_for(&prior, "Write a story about a coder; a lonely one; a kind one."), COPY_GUARD_CHARS, "prose with semicolons is not code");
+    }
+}
+
+#[cfg(test)]
+mod stuck_tests {
+    use super::*;
+
+    #[test]
+    fn a_runaway_repeat_is_caught() {
+        assert!(stuck_repeating(&"banana ".repeat(100)));
+        assert!(stuck_repeating(&format!("Sure! {}", "ha ".repeat(250))));
+        assert!(stuck_repeating(&"!".repeat(700)));
+    }
+
+    #[test]
+    fn asked_for_repetition_and_normal_text_are_not() {
+        assert!(!stuck_repeating(&"banana ".repeat(30)), "30 bananas (210 chars) is what was asked for");
+        let story = "The fox walked through the forest. It found a lantern glowing softly. ".to_string()
+            + "Its friends gathered around, amazed by the warm light, and together they explored the woods. "
+            + "Night after night they returned, each time discovering something new beneath the old trees. "
+            + "The owl told stories, the rabbits danced, and the fox kept the lantern burning bright for all. "
+            + "Seasons changed, snow fell and melted, flowers bloomed, and still the little light shone on.";
+        assert!(!stuck_repeating(&story));
+        assert!(!stuck_repeating("short"));
     }
 }
 
 #[cfg(test)]
 mod reply_length_tests {
     use super::*;
+
+    #[test]
+    fn a_requested_length_caps_a_manual_setting() {
+        // On Max (3000), "a 400 word story" ran to 1,750 words.
+        assert_eq!(resolve_max_tokens(Some(3000), "Write a 400 word story"), 680);
+        assert_eq!(resolve_max_tokens(Some(300), "Write a 400 word story"), 300, "a lower manual limit still wins");
+        assert_eq!(resolve_max_tokens(Some(3000), "Write a story"), 3000, "no length named: the setting applies");
+    }
 
     #[test]
     fn manual_limit_wins_and_is_clamped() {

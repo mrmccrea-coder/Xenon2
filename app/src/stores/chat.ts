@@ -788,7 +788,7 @@ export const useChatStore = defineStore("chat", {
         // Same rule as the backend's ends_with_stop: a role label on its own line, or glued onto
         // the end of a word ("...the young foxUser:"), is the start of a turn the model invented.
         msg.content = msg.content
-          .replace(/(?:\n\s*|(?<=[\p{L}\p{N}.!?"')]))(?:[Uu]ser|[Aa]ssistant|Xenon):\s*$/u, "")
+          .replace(/(?:\n\s*|(?<=\S))(?:[Uu]ser|[Aa]ssistant|Xenon):\s*$/u, "")
           .trimEnd();
         // Phase 7 follow-up (2026-08-02): a small base model leans heavily on whatever style its
         // prompt demonstrates -- the seed example used to end with "How can I help you today?"
