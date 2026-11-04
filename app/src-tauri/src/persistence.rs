@@ -255,6 +255,23 @@ pub async fn pick_open_dialog(_app: AppHandle) -> Result<Option<String>, String>
         })
 }
 
+/// Deletes a conversation's file, but only an auto-saved one: the file must be a `.json` directly
+/// inside this app's conversations folder. A file the user saved somewhere else with Save As is
+/// theirs, so it is left alone (returns `Ok(false)`); the conversation just leaves the sidebar.
+#[tauri::command]
+pub fn delete_conversation_file(app: AppHandle, path: String) -> Result<bool, String> {
+    let dir = PathBuf::from(crate::memory::effective_conversations_dir(app)?);
+    let Ok(dir) = dir.canonicalize() else { return Ok(false) };
+    let Ok(file) = PathBuf::from(&path).canonicalize() else { return Ok(false) }; // already gone
+    let is_ours = file.parent() == Some(dir.as_path())
+        && file.extension().and_then(|e| e.to_str()) == Some("json");
+    if !is_ours {
+        return Ok(false);
+    }
+    fs::remove_file(&file).map_err(|e| format!("Could not delete '{}': {e}", file.display()))?;
+    Ok(true)
+}
+
 /// Loads `session.json` from the app-data directory. A missing file is normal (first ever launch)
 /// and returns an empty default session, not an error.
 #[tauri::command]

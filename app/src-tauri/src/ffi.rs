@@ -66,6 +66,10 @@ extern "C" {
 
     pub fn xenon_state_reset(engine: *mut XenonEngine, state: *mut XenonState);
 
+    /// Copy guard: with `n >= 2`, generation never completes a run of `n` tokens identical to one
+    /// already in the state's history. 0 turns it off (the engine default).
+    pub fn xenon_set_no_repeat_ngram(engine: *mut XenonEngine, n: u32);
+
     pub fn xenon_prefill(engine: *mut XenonEngine, state: *mut XenonState, text: *const c_char) -> XenonStatus;
 
     pub fn xenon_generate_with_state(

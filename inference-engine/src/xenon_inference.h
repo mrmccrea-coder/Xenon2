@@ -127,6 +127,14 @@ XENON_API void xenon_state_copy(xenon_state * dst, const xenon_state * src);
 // logits cleared, repeat-penalty token window cleared.
 XENON_API void xenon_state_reset(xenon_engine * engine, xenon_state * state);
 
+// Copy guard. n >= 2 makes every later generation on `engine` refuse to produce a token that would
+// complete a run of n tokens identical to a run already in the state's history (the last ~4k
+// tokens fed or generated). Stops the model re-emitting its previous long reply word for word.
+// n of 0 or 1 turns it off, which is the default, so callers that never call this are unaffected.
+// Like everything on an engine this is not thread-safe: set it while holding whatever lock
+// serializes generation. A run of 8 tokens (about six words) is the setting the app uses.
+XENON_API void xenon_set_no_repeat_ngram(xenon_engine * engine, uint32_t n);
+
 // Evaluates `text` into `state` WITHOUT generating anything -- pure prefill. Advances `state`'s
 // RWKV state, cached logits (from the last token of `text`), and repeat-penalty token window in
 // place, exactly as if `text` had been the tail of a prompt fed to xenon_generate() from a fresh

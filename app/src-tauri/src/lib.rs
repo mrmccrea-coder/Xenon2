@@ -1,3 +1,4 @@
+mod calc;
 mod ffi;
 mod hardware;
 mod image;
@@ -7,6 +8,7 @@ mod models_dl;
 mod paths;
 mod persistence;
 mod sloth_memory;
+mod taskbar;
 mod voice;
 
 use tauri::{Manager, PhysicalPosition, PhysicalSize};
@@ -70,6 +72,7 @@ pub fn run() {
 
             let (engine_state, model_info, device_info) = inference::load_engine(app.handle(), &repo_root);
             app.manage(engine_state);
+            app.manage(inference::CancelFlag::default());
             app.manage(model_info);
             app.manage(device_info);
             // Phase 6: export/import need to find models/, inference-engine/data/, and
@@ -161,6 +164,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             inference::generate_response,
+            inference::stop_generation,
+            taskbar::taskbar_inset,
+            persistence::delete_conversation_file,
             inference::get_model_name,
             inference::get_inference_device,
             inference::list_models,
@@ -170,6 +176,7 @@ pub fn run() {
             image::image_status,
             image::generate_image,
             image::read_image,
+            image::save_image_as,
             models_dl::download_model,
             models_dl::cancel_model_download,
             persistence::save_conversation_file,

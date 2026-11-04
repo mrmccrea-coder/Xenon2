@@ -11,7 +11,7 @@
 // treated as one deletable unit rather than leaving an orphaned reply with no prompt above it.
 // Confirmed via a native confirm() before emitting, since this is destructive and there's no undo.
 
-import { ref, watch } from "vue";
+import { computed, ref, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import type { ChatMessage } from "../types";
 
@@ -83,6 +83,58 @@ function onRegenerate() {
   emit("regenerate");
 }
 
+// Picture requests are stored as "/image <prompt>" (so the chat model sees what was asked for in
+// later turns); show them as a labelled request instead of a raw command.
+const pictureRequest = computed(() =>
+  props.message.role === "user" && props.message.content.startsWith("/image ")
+    ? props.message.content.slice("/image ".length)
+    : null
+);
+
+// Download button on a picture: opens a Save dialog and copies the PNG to the chosen place.
+const saveState = ref<"idle" | "saving" | "saved" | "error">("idle");
+const savedTo = ref("");
+const saveMessage = ref("");
+async function downloadImage() {
+  if (!props.message.image) return;
+  saveState.value = "saving";
+  saveMessage.value = "";
+  try {
+    const dest = await invoke<string | null>("save_image_as", {
+      path: props.message.image,
+      suggestedName: props.message.imagePrompt ?? null,
+    });
+    if (!dest) {
+      saveState.value = "idle"; // cancelled
+      return;
+    }
+    savedTo.value = dest;
+    saveState.value = "saved";
+    saveMessage.value = `Saved to ${dest}`;
+    window.setTimeout(() => {
+      if (saveState.value === "saved") {
+        saveState.value = "idle";
+        saveMessage.value = "";
+      }
+    }, 4000);
+  } catch (err) {
+    saveState.value = "error";
+    saveMessage.value = `Could not save: ${String(err)}`;
+  }
+}
+
+// Copy a reply to the clipboard; the icon turns into a tick for a moment as confirmation.
+const copied = ref(false);
+async function copyReply() {
+  try {
+    await navigator.clipboard.writeText(props.message.content);
+    copied.value = true;
+    window.setTimeout(() => (copied.value = false), 1500);
+  } catch (err) {
+    console.warn("[ChatMessage] copy failed:", err);
+  }
+}
+
 function onDelete() {
   if (props.disabled) return;
   const msg =
@@ -113,9 +165,33 @@ function onDelete() {
 
       <template v-else>
         <template v-if="message.image">
-          <img v-if="imgSrc" class="gen-image" :src="imgSrc" :alt="message.imagePrompt || 'Generated image'" />
+          <div v-if="imgSrc" class="image-wrap">
+            <img class="gen-image" :src="imgSrc" :alt="message.imagePrompt || 'Generated image'" />
+            <button
+              class="download-btn"
+              :class="{ done: saveState === 'saved' }"
+              :title="saveState === 'saved' ? `Saved to ${savedTo}` : 'Download this picture'"
+              aria-label="Download this picture"
+              :disabled="saveState === 'saving'"
+              @click="downloadImage"
+            >
+              <svg v-if="saveState !== 'saved'" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                <polyline points="7 10 12 15 17 10" />
+                <line x1="12" y1="15" x2="12" y2="3" />
+              </svg>
+              <svg v-else viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <polyline points="20 6 9 17 4 12" />
+              </svg>
+            </button>
+          </div>
           <div v-else class="content">{{ imgError || "Loading image..." }}</div>
+          <div v-if="saveMessage" class="save-message" :class="{ error: saveState === 'error' }">{{ saveMessage }}</div>
           <div class="image-caption">{{ message.imagePrompt }}</div>
+        </template>
+        <template v-else-if="pictureRequest !== null">
+          <div class="picture-tag">Picture request</div>
+          <div class="content">{{ pictureRequest }}</div>
         </template>
         <div v-else class="content">
           {{ message.content }}<span v-if="message.streaming" class="cursor">▍</span>
@@ -138,6 +214,20 @@ function onDelete() {
             </button>
           </template>
           <template v-else>
+            <button
+              v-if="!message.image && !message.streaming && message.content"
+              class="icon-btn"
+              :title="copied ? 'Copied!' : 'Copy reply'"
+              @click="copyReply"
+            >
+              <svg v-if="!copied" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="9" y="9" width="13" height="13" rx="2" />
+                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+              </svg>
+              <svg v-else viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="20 6 9 17 4 12" />
+              </svg>
+            </button>
             <button class="icon-btn" title="Regenerate" @click="onRegenerate">⟳</button>
             <button class="icon-btn" title="Delete" @click="onDelete">
               <!-- Inline SVG -- 🗑 was found to render as a garbled fallback glyph in this
@@ -171,11 +261,73 @@ function onDelete() {
   justify-content: flex-start;
 }
 
+.picture-tag {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  opacity: 0.8;
+  margin-bottom: 0.15rem;
+}
+
+.image-wrap {
+  position: relative;
+  display: inline-block;
+  max-width: 100%;
+}
+
 .gen-image {
   display: block;
   max-width: 100%;
   max-height: 60vh;
   border-radius: 8px;
+}
+
+/* Download button, top-right corner of the picture. Always visible (discoverable), stronger on hover. */
+.download-btn {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 2.1rem;
+  height: 2.1rem;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  background: rgba(0, 0, 0, 0.45);
+  color: #fff;
+  cursor: pointer;
+  opacity: 0.75;
+  transition: opacity 0.15s, background 0.15s;
+}
+
+.image-wrap:hover .download-btn,
+.download-btn:focus-visible {
+  opacity: 1;
+}
+
+.download-btn:hover {
+  background: rgba(47, 111, 235, 0.85);
+}
+
+.download-btn.done {
+  background: rgba(40, 160, 90, 0.9);
+  opacity: 1;
+}
+
+.download-btn:disabled {
+  cursor: wait;
+}
+
+.save-message {
+  margin-top: 0.3rem;
+  font-size: 0.75rem;
+  color: #8fd19e;
+  word-break: break-all;
+}
+
+.save-message.error {
+  color: #ff9a9a;
 }
 
 .image-caption {

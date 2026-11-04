@@ -139,6 +139,21 @@ interface ChatState {
   imageSize: number;
   /** When on, the next sent message is drawn as a picture instead of answered as chat. */
   imageMode: boolean;
+  /** Maximum reply length in tokens, set from the "Reply length" control above the chat.
+   * 0 = Auto (the backend sizes it to each request). Remembered across restarts. */
+  replyTokens: number;
+}
+
+const REPLY_TOKENS_KEY = "xenon2.replyTokens";
+
+/** Reads the saved reply length; storage can be unavailable or hold junk, so never throw. */
+function loadReplyTokens(): number {
+  try {
+    const n = Number(localStorage.getItem(REPLY_TOKENS_KEY));
+    return Number.isFinite(n) && n >= 16 ? Math.min(Math.round(n), 3000) : 0;
+  } catch {
+    return 0;
+  }
 }
 
 export interface ModelOption {
@@ -248,6 +263,7 @@ export const useChatStore = defineStore("chat", {
     imageModel: null,
     imageSize: 768,
     imageMode: false,
+    replyTokens: loadReplyTokens(),
   }),
 
   getters: {
@@ -296,6 +312,39 @@ export const useChatStore = defineStore("chat", {
       this.backendError = null;
       this.fileError = null;
       void this.persistSession();
+    },
+
+    /** Stop button: ends the reply being written. What was already written is kept and saved
+     * through the normal completion path. */
+    async stopGeneration(): Promise<void> {
+      try {
+        await invoke("stop_generation");
+      } catch (err) {
+        console.warn("[chat store] stop_generation failed:", err);
+      }
+    },
+
+    /** Removes a conversation from the sidebar and deletes its auto-saved file. A file saved
+     * elsewhere with Save As is left on disk (the backend refuses to touch it). Refused while that
+     * conversation is still receiving a reply. */
+    async deleteConversation(id: string): Promise<void> {
+      if (this.streamingMessageIds[id]) return;
+      const idx = this.conversations.findIndex((c) => c.id === id);
+      if (idx === -1) return;
+      const path = this.filePaths[id];
+      this.conversations.splice(idx, 1);
+      delete this.filePaths[id];
+      if (this.activeId === id) {
+        this.setActive(this.conversations[Math.min(idx, this.conversations.length - 1)]?.id ?? null);
+      }
+      await this.persistSession();
+      if (path) {
+        try {
+          await invoke<boolean>("delete_conversation_file", { path });
+        } catch (err) {
+          this.fileError = `Removed from the list, but the file could not be deleted: ${String(err)}`;
+        }
+      }
     },
 
     selectConversation(id: string): void {
@@ -556,7 +605,12 @@ export const useChatStore = defineStore("chat", {
       this.backendError = null;
 
       try {
-        await invoke("generate_response", { conversationId, history, agent: assistantMsg.agent ?? "dementia" });
+        await invoke("generate_response", {
+          conversationId,
+          history,
+          agent: assistantMsg.agent ?? "dementia",
+          maxTokens: this.replyTokens > 0 ? this.replyTokens : null,
+        });
       } catch (err) {
         this.generating = false;
         delete this.streamingMessageIds[conversationId];
@@ -731,7 +785,11 @@ export const useChatStore = defineStore("chat", {
         // The Rust backend's stop-sequence check stops generation as soon as the model starts a
         // new "User:" turn, but that stop-sequence text has already been streamed and appended --
         // strip it here so the bubble shows only Xenon's actual reply.
-        msg.content = msg.content.replace(/\n+\s*[Uu]ser:\s*$/, "").trimEnd();
+        // Same rule as the backend's ends_with_stop: a role label on its own line, or glued onto
+        // the end of a word ("...the young foxUser:"), is the start of a turn the model invented.
+        msg.content = msg.content
+          .replace(/(?:\n\s*|(?<=[\p{L}\p{N}.!?"')]))(?:[Uu]ser|[Aa]ssistant|Xenon):\s*$/u, "")
+          .trimEnd();
         // Phase 7 follow-up (2026-08-02): a small base model leans heavily on whatever style its
         // prompt demonstrates -- the seed example used to end with "How can I help you today?"
         // and the model picked that up as a closing habit for nearly every reply regardless of
@@ -895,6 +953,17 @@ export const useChatStore = defineStore("chat", {
         console.warn("[chat store] image_status failed:", err);
         this.imageAvailable = false;
         this.imageReason = String(err);
+      }
+    },
+
+    /** Sets the reply length (tokens). 0 = Auto. Clamped to the backend's 16..3000 range. */
+    setReplyTokens(n: number): void {
+      const v = !Number.isFinite(n) || n <= 0 ? 0 : Math.min(3000, Math.max(16, Math.round(n)));
+      this.replyTokens = v;
+      try {
+        localStorage.setItem(REPLY_TOKENS_KEY, String(v));
+      } catch {
+        // Storage unavailable: the setting still applies for this session.
       }
     },
 

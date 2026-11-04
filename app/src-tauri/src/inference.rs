@@ -8,6 +8,7 @@
 use std::cell::RefCell;
 use std::ffi::{c_void, CStr, CString};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -803,15 +804,22 @@ fn history_text(turns: &[ChatTurn]) -> String {
 /// and Sloth's persistent facts injection (skipped entirely for Dementia turns, which always
 /// pass an empty `facts` slice, so Dementia's volatile header is byte-for-byte what it always
 /// was pre-Phase-8, just at a different position in the overall prompt).
-fn volatile_header_text(facts: &[sloth_memory::SlothFact]) -> String {
+///
+/// 2026-11-04: the clock text (and its example) is now included ONLY when the user's message
+/// mentions time or dates (`mentions_time_or_date`). It used to be injected into every prompt, so
+/// the model saw -- and sometimes volunteered -- the time in unrelated answers. It is the real
+/// system time whenever it is included.
+fn volatile_header_text(facts: &[sloth_memory::SlothFact], include_clock: bool) -> String {
     let mut out = String::new();
 
     let now = chrono::Local::now();
     let now_full = now.format("%A, %B %d, %Y, %I:%M %p").to_string();
     let now_time_only = now.format("%I:%M %p").to_string();
-    out.push_str("The current date and time is ");
-    out.push_str(&now_full);
-    out.push_str(".\n\n");
+    if include_clock {
+        out.push_str("The current date and time is ");
+        out.push_str(&now_full);
+        out.push_str(".\n\n");
+    }
 
     if !facts.is_empty() {
         out.push_str("Known facts about the user, remembered from past conversations:\n");
@@ -830,16 +838,141 @@ fn volatile_header_text(facts: &[sloth_memory::SlothFact]) -> String {
     // pattern instead. Using the real time here means the example is never factually wrong
     // regardless of when it's generated, so there's no risk of the model anchoring on a stale or
     // made-up value the way a fixed example would.
-    out.push_str(&format!(
-        "User: What time is it?\n\n\
-         Xenon: It's currently {now_time_only}.\n\n"
-    ));
+    if include_clock {
+        out.push_str(&format!(
+            "User: What time is it?\n\n\
+             Xenon: It's currently {now_time_only}.\n\n"
+        ));
+    }
 
     out
 }
 
+/// Chat replies may not complete a run of this many tokens (about six words) that already appears
+/// earlier in the conversation. Added 2026-11-04: once replies could run long, the model began
+/// answering follow-ups ("write a different story", "add to the story") by re-emitting its
+/// previous long reply word for word -- three byte-identical replies in a row -- because the
+/// repeat penalty only looks back 256 tokens and the start of the old reply was outside that.
+/// Short runs (names, a few repeated words) are unaffected; only real copying is blocked.
+const COPY_GUARD_NGRAM: u32 = 10;
+
+/// Lower-cased, whitespace-collapsed, trailing-punctuation-free form of a message, so "What is
+/// 6 times 7?" and "what is 6 times 7" count as the same question.
+fn normalize_question(s: &str) -> String {
+    let lower = s.to_lowercase();
+    let collapsed = lower.split_whitespace().collect::<Vec<_>>().join(" ");
+    collapsed.trim_end_matches(|c: char| c.is_ascii_punctuation() || c.is_whitespace()).to_string()
+}
+
+/// Earlier replies at least this long (characters; about 140 tokens) can fall outside the repeat
+/// penalty's 256-token window by the time the next reply starts, which is the only situation in
+/// which the model can copy one back word for word. Shorter replies are covered by the penalty
+/// alone, so the guard stays off for them and cannot disturb short repeated answers -- a count, a
+/// list, a one-line fact. (Measured: with the guard always on, asking for "count from one to ten"
+/// a second time, reworded, came back cut off as "1, 2, 3, 4, 5...".)
+const COPY_GUARD_MIN_PRIOR_REPLY_CHARS: usize = 600;
+
+/// True for messages that carry code: repeating long runs of text exactly is correct there.
+fn looks_like_code(s: &str) -> bool {
+    s.contains("```")
+        || s.lines()
+            .filter(|l| {
+                let t = l.trim_end();
+                t.ends_with(';') || t.ends_with('{') || t.ends_with('}')
+            })
+            .count()
+            >= 3
+}
+
+/// How the copy guard should be set for this turn: `COPY_GUARD_NGRAM`, or 0 (off). It is on only
+/// when a long earlier reply exists that could be copied back, and off whenever producing
+/// identical text is what the user wants: they asked the very same question again, asked for
+/// something to be repeated or quoted, or sent code.
+fn copy_guard_for(prior_turns: &[ChatTurn], new_text: &str) -> u32 {
+    let lower = new_text.to_lowercase();
+    const EXACT_REQUESTS: [&str; 8] = [
+        "repeat", "say that again", "say it again", "word for word", "verbatim", "read that back",
+        "read it back", "quote",
+    ];
+    if EXACT_REQUESTS.iter().any(|p| lower.contains(p)) || looks_like_code(new_text) {
+        return 0;
+    }
+    let q = normalize_question(new_text);
+    if !q.is_empty() && prior_turns.iter().any(|t| t.role == "user" && normalize_question(&t.content) == q) {
+        return 0;
+    }
+    let has_long_reply = prior_turns
+        .iter()
+        .any(|t| t.role == "assistant" && t.content.chars().count() >= COPY_GUARD_MIN_PRIOR_REPLY_CHARS);
+    if !has_long_reply {
+        return 0;
+    }
+    COPY_GUARD_NGRAM
+}
+
+/// Hard bounds on a reply, whatever the UI sends.
+const MIN_REPLY_TOKENS: u32 = 16;
+const MAX_REPLY_TOKENS: u32 = 3000;
+
+/// The reply-length budget for one turn. `requested` is the user's setting from the Reply length
+/// control (`None` or 0 = Auto). Auto sizes the budget to the request: an explicit length ("400
+/// word story") is honoured (~1.5 tokens per word plus headroom), writing-type requests get a
+/// long budget, and everything else a modest one. Short answers still stop on their own, so a
+/// bigger cap never slows a short reply down -- it only matters for replies that run long.
+fn resolve_max_tokens(requested: Option<u32>, user_text: &str) -> u32 {
+    if let Some(n) = requested.filter(|n| *n > 0) {
+        return n.clamp(MIN_REPLY_TOKENS, MAX_REPLY_TOKENS);
+    }
+    let lower = user_text.to_lowercase();
+    let words: Vec<&str> = lower.split(|c: char| !(c.is_alphanumeric())).filter(|w| !w.is_empty()).collect();
+    // "400 word story", "400-word", "400 words"
+    for pair in words.windows(2) {
+        if let Ok(n) = pair[0].parse::<u32>() {
+            if pair[1] == "word" || pair[1] == "words" {
+                return (n.saturating_mul(3) / 2 + 80).clamp(150, 2000);
+            }
+        }
+    }
+    const LONG_FORM: [&str; 12] = [
+        "story", "essay", "article", "poem", "explain", "describe", "tutorial", "detailed",
+        "summarize", "summary", "write", "steps",
+    ];
+    if words.iter().any(|w| LONG_FORM.contains(w)) {
+        return 700;
+    }
+    300
+}
+
+/// True when the user's message is about time or dates, so the real clock should go into the
+/// prompt. Whole-word match (so "sometimes" or "holiday" don't count); a false positive only
+/// costs one harmless extra line, a false negative means the model can't see the time it was
+/// asked about, so the list errs on the broad side.
+fn mentions_time_or_date(user_text: &str) -> bool {
+    const WORDS: [&str; 22] = [
+        "time", "date", "day", "today", "tonight", "tomorrow", "yesterday", "clock", "month",
+        "year", "week", "weekday", "hour", "minute", "morning", "afternoon", "evening", "night",
+        "oclock", "o'clock", "pm", "weekend",
+    ];
+    user_text
+        .to_lowercase()
+        .split(|c: char| !(c.is_alphanumeric() || c == '\''))
+        .any(|w| WORDS.contains(&w))
+}
+
+/// True once the model starts writing a turn of its own instead of finishing Xenon's reply. A role
+/// label at the start of a line ("\n\nUser:", "\nAssistant:") always counts; so does one glued
+/// straight onto the end of a word or sentence ("...the young foxUser: How do I...", seen in
+/// testing 2026-11-04 -- the model's escape hatch when the copy guard stops it copying). A label
+/// after a space ("as the User: field shows") is ordinary text and does not.
 fn ends_with_stop(tail: &str) -> bool {
-    tail.ends_with("\n\nUser:") || tail.ends_with("\n\nuser:")
+    const LABELS: [&str; 5] = ["User:", "user:", "Assistant:", "assistant:", "Xenon:"];
+    LABELS.iter().any(|label| match tail.strip_suffix(label) {
+        Some(before) => match before.chars().last() {
+            None => false, // label alone with nothing before it in the tail window: can't tell
+            Some(c) => c == '\n' || c.is_alphanumeric() || ".!?\"')".contains(c),
+        },
+        None => false,
+    })
 }
 
 /// Context handed to the C callback via the `user_data` void*. The callback runs synchronously
@@ -853,6 +986,19 @@ struct CallbackCtx {
     /// for the extraction call itself (see `run_fact_extraction`), which uses a separate,
     /// simpler callback that doesn't emit `token-stream` events.
     full_text: RefCell<String>,
+    /// Set by the Stop button (`stop_generation`); checked before every token.
+    cancel: Arc<AtomicBool>,
+}
+
+/// Shared "stop the reply now" flag. Cleared when a new reply is requested, set by
+/// `stop_generation`, read by `on_token`, which ends generation at the next token. The reply so
+/// far is kept and finishes through the normal `generation-done` path, so it is saved as usual.
+#[derive(Default)]
+pub struct CancelFlag(pub Arc<AtomicBool>);
+
+#[tauri::command]
+pub fn stop_generation(cancel: tauri::State<'_, CancelFlag>) {
+    cancel.0.store(true, Ordering::SeqCst);
 }
 
 extern "C" fn on_token(
@@ -864,6 +1010,10 @@ extern "C" fn on_token(
         return true;
     }
     let ctx = unsafe { &*(user_data as *const CallbackCtx) };
+
+    if ctx.cancel.load(Ordering::SeqCst) {
+        return false; // Stop button: end here, keep what was already streamed
+    }
 
     let text_str = if text.is_null() {
         ""
@@ -993,6 +1143,10 @@ fn run_fact_extraction(
 
     let scratch = unsafe { ffi::xenon_state_new(engine) };
     unsafe { ffi::xenon_state_copy(scratch, extraction_prefix.0) };
+    // Extraction deliberately copies phrases out of the user's message ("likes power metal
+    // music"), so the copy guard must be off here. The engine setting is shared and calls are
+    // serialized by the engine lock, so every generation sets it explicitly.
+    unsafe { ffi::xenon_set_no_repeat_ngram(engine, 0) };
 
     let buf = RefCell::new(String::new());
     let buf_ptr = &buf as *const RefCell<String> as *mut c_void;
@@ -1196,6 +1350,8 @@ fn generate_blocking(
     conversation_id: String,
     history: Vec<ChatTurn>,
     agent: String,
+    requested_max_tokens: Option<u32>,
+    cancel: Arc<AtomicBool>,
 ) -> Option<PendingExtraction> {
     if !inner.is_loaded() {
         let _ = app.emit(
@@ -1232,7 +1388,11 @@ fn generate_blocking(
         }
     };
 
-    if let Some(answer) = try_answer_time_date_deterministically(&new_user_turn.content) {
+    // Clock questions, then maths (built-in calculator, see calc.rs): both have one exact answer,
+    // so they bypass the model, which only approximates them.
+    if let Some(answer) = try_answer_time_date_deterministically(&new_user_turn.content)
+        .or_else(|| crate::calc::try_answer(&new_user_turn.content))
+    {
         let _ = app.emit(
             "token-stream",
             TokenEvent { conversation_id: conversation_id.clone(), text: answer },
@@ -1257,7 +1417,7 @@ fn generate_blocking(
 
     let suffix = format!(
         "{}User: {}\n\nXenon:",
-        volatile_header_text(&facts),
+        volatile_header_text(&facts, mentions_time_or_date(&new_user_turn.content)),
         new_user_turn.content.trim()
     );
     let suffix_c = match CString::new(suffix) {
@@ -1280,15 +1440,20 @@ fn generate_blocking(
         conversation_id: conversation_id.clone(),
         tail: RefCell::new(String::new()),
         full_text: RefCell::new(String::new()),
+        cancel,
     };
     let ctx_ptr = &ctx as *const CallbackCtx as *mut c_void;
 
+    // Copy guard (see COPY_GUARD_NGRAM): keeps the model from re-emitting an earlier reply.
+    unsafe { ffi::xenon_set_no_repeat_ngram(engine, copy_guard_for(prior_turns, &new_user_turn.content)) };
     let status = unsafe {
         ffi::xenon_generate_with_state(
             engine,
             turn_state,
             suffix_c.as_ptr(),
-            600,  // max_tokens (raised from 200 on 2026-11-04: long replies were cut mid-sentence)
+            // User-set limit from the "Reply length" control, or Auto (sized to the request).
+            // Was a fixed 200, then 600 (2026-11-04) after long replies were cut mid-sentence.
+            resolve_max_tokens(requested_max_tokens, &new_user_turn.content) as i32,
             0.8,  // temperature (matches Phase 1 CLI harness default)
             0.5,  // top_p (matches Phase 1 CLI harness default)
             // repeat_penalty (Phase 7 follow-up, 2026-08-02): added after real usage showed this
@@ -1355,7 +1520,14 @@ pub async fn generate_response(
     conversation_id: String,
     history: Vec<ChatTurn>,
     agent: String,
+    max_tokens: Option<u32>,
+    cancel: tauri::State<'_, CancelFlag>,
 ) -> Result<(), String> {
+    // A new request clears any earlier Stop. Done here, when the request arrives, rather than
+    // when generation starts, so a Stop pressed while this request waits for the engine still
+    // takes effect.
+    cancel.0.store(false, Ordering::SeqCst);
+    let cancel_flag = cancel.0.clone();
     let engine_arc = engine.0.clone();
     let extraction_app = app.clone();
     let extraction_engine_arc = engine_arc.clone();
@@ -1369,7 +1541,7 @@ pub async fn generate_response(
             Err(poisoned) => poisoned.into_inner(),
         };
         debug_timing_log("engine lock acquired (main)");
-        let pending = generate_blocking(&mut guard, app, conversation_id, history, agent);
+        let pending = generate_blocking(&mut guard, app, conversation_id, history, agent, max_tokens, cancel_flag);
         drop(guard); // release before scheduling extraction -- this is the actual fix
         debug_timing_log("engine lock released (main)");
 
@@ -1397,6 +1569,150 @@ pub async fn generate_response(
     })
     .await
     .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod stop_tests {
+    use super::*;
+
+    #[test]
+    fn a_new_turn_on_its_own_line_stops() {
+        assert!(ends_with_stop("the end.\n\nUser:"));
+        assert!(ends_with_stop("the end.\nUser:"));
+        assert!(ends_with_stop("the end.\n\nAssistant:"));
+        assert!(ends_with_stop("the end.\nXenon:"));
+    }
+
+    #[test]
+    fn a_turn_glued_onto_the_reply_stops() {
+        assert!(ends_with_stop("As the night wore on, the young foxUser:"));
+        assert!(ends_with_stop("they all went home.User:"));
+        assert!(ends_with_stop("he said \"goodbye\"Assistant:"));
+    }
+
+    #[test]
+    fn ordinary_text_does_not_stop() {
+        // a label after a space is ordinary prose, not a new turn
+        assert!(!ends_with_stop("type your name in the box labelled User:"));
+        assert!(!ends_with_stop("the chat log starts with Assistant:"));
+        assert!(!ends_with_stop("The answer is 42."));
+    }
+}
+
+#[cfg(test)]
+mod copy_guard_tests {
+    use super::*;
+
+    fn turn(role: &str, content: &str) -> ChatTurn {
+        ChatTurn { role: role.to_string(), content: content.to_string() }
+    }
+
+    /// A reply long enough (> COPY_GUARD_MIN_PRIOR_REPLY_CHARS) to be copied back by the model.
+    fn long_reply() -> String {
+        "Once upon a time, in a dense forest, a fox found a lantern. ".repeat(14)
+    }
+
+    #[test]
+    fn guard_is_on_for_a_new_request_after_a_long_reply() {
+        let long = long_reply();
+        assert!(long.chars().count() >= COPY_GUARD_MIN_PRIOR_REPLY_CHARS);
+        let prior = [turn("user", "Write a story about a fox"), turn("assistant", &long)];
+        assert_eq!(copy_guard_for(&prior, "write a story of how the fox brings his friends"), COPY_GUARD_NGRAM);
+        assert_eq!(copy_guard_for(&prior, "add to the story"), COPY_GUARD_NGRAM);
+        // an older long reply still counts later in the conversation
+        let later = [
+            turn("user", "Write a story"), turn("assistant", &long),
+            turn("user", "thanks"), turn("assistant", "You're welcome."),
+        ];
+        assert_eq!(copy_guard_for(&later, "write another one"), COPY_GUARD_NGRAM);
+    }
+
+    #[test]
+    fn guard_is_off_when_no_long_reply_exists() {
+        // The measured regression: reworded counting after only short replies was cut to "1, 2, 3, 4, 5...".
+        assert_eq!(copy_guard_for(&[], "Hello"), 0);
+        let prior = [turn("user", "Count from 1 to 10."), turn("assistant", "1, 2, 3, 4, 5, 6, 7, 8, 9, 10.")];
+        assert_eq!(copy_guard_for(&prior, "Please count from one up to ten for me."), 0);
+    }
+
+    #[test]
+    fn guard_is_off_when_the_same_question_is_asked_again() {
+        let long = long_reply();
+        let prior = [turn("user", "What is 6 times 7?"), turn("assistant", "42"), turn("user", "Write a story"), turn("assistant", &long)];
+        assert_eq!(copy_guard_for(&prior, "what is 6 times 7"), 0, "case and trailing punctuation don't matter");
+        assert_eq!(copy_guard_for(&prior, "  What is   6 times 7 ?! "), 0);
+        assert_eq!(copy_guard_for(&prior, "What is 6 times 8?"), COPY_GUARD_NGRAM, "a different question is guarded");
+    }
+
+    #[test]
+    fn guard_is_off_when_asked_to_repeat_or_quote() {
+        let long = long_reply();
+        let prior = [turn("user", "Tell me a story"), turn("assistant", &long)];
+        assert_eq!(copy_guard_for(&prior, "Can you repeat that?"), 0);
+        assert_eq!(copy_guard_for(&prior, "say it again"), 0);
+        assert_eq!(copy_guard_for(&prior, "give me that word for word"), 0);
+        assert_eq!(copy_guard_for(&prior, "quote the first line"), 0);
+        assert_eq!(copy_guard_for(&prior, "tell me another story"), COPY_GUARD_NGRAM);
+    }
+
+    #[test]
+    fn guard_is_off_for_code() {
+        let long = long_reply();
+        let prior = [turn("user", "Tell me a story"), turn("assistant", &long)];
+        assert_eq!(copy_guard_for(&prior, "fix this:\n```java\nint x = 1;\n```"), 0);
+        assert_eq!(copy_guard_for(&prior, "why does\nint a = 1;\nint b = 2;\nint c = 3;\nfail?"), 0);
+        assert_eq!(copy_guard_for(&prior, "Write a story about a coder; a lonely one; a kind one."), COPY_GUARD_NGRAM, "prose with semicolons is not code");
+    }
+}
+
+#[cfg(test)]
+mod reply_length_tests {
+    use super::*;
+
+    #[test]
+    fn manual_limit_wins_and_is_clamped() {
+        assert_eq!(resolve_max_tokens(Some(900), "hi"), 900);
+        assert_eq!(resolve_max_tokens(Some(1), "hi"), MIN_REPLY_TOKENS);
+        assert_eq!(resolve_max_tokens(Some(999_999), "hi"), MAX_REPLY_TOKENS);
+    }
+
+    #[test]
+    fn auto_follows_the_request() {
+        assert_eq!(resolve_max_tokens(None, "What is 6 times 7?"), 300);
+        assert_eq!(resolve_max_tokens(Some(0), "What is 6 times 7?"), 300, "0 means Auto");
+        assert_eq!(resolve_max_tokens(None, "Write a story about a dragon"), 700);
+        assert_eq!(resolve_max_tokens(None, "Write a 400 word story"), 680);
+        assert_eq!(resolve_max_tokens(None, "give me a 300-word essay"), 530);
+        assert_eq!(resolve_max_tokens(None, "write a 5000 word novel"), 2000, "auto stays bounded");
+        assert_eq!(resolve_max_tokens(None, "a 10 word slogan"), 150, "never below the floor");
+    }
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::*;
+
+    #[test]
+    fn clock_only_when_time_or_date_is_mentioned() {
+        for q in ["What time is it?", "what's the date today", "Is it morning yet?", "what day is it", "Do you know the time?", "How many hours...? no: what is the year"] {
+            assert!(mentions_time_or_date(q), "should include clock for: {q}");
+        }
+        for q in ["What is 6 times 7?", "I am Zephyr and I love teal", "Tell me a joke", "Write a story about a holiday", "sometimes I wonder", "Who wrote Romeo and Juliet?"] {
+            assert!(!mentions_time_or_date(q), "should NOT include clock for: {q}");
+        }
+    }
+
+    #[test]
+    fn header_has_real_clock_only_when_asked() {
+        let off = volatile_header_text(&[], false);
+        assert!(!off.contains("current date and time"));
+        assert!(!off.contains("What time is it?"));
+        assert!(off.is_empty(), "no facts + no clock = nothing extra in the prompt");
+        let on = volatile_header_text(&[], true);
+        assert!(on.contains("The current date and time is "));
+        let year = chrono::Local::now().format("%Y").to_string();
+        assert!(on.contains(&year), "the clock text is the real system date");
+    }
 }
 
 #[cfg(test)]

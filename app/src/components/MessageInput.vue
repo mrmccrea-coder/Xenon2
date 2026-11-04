@@ -8,11 +8,14 @@
 // App.vue feeds into the exact same store.sendMessage path typed text uses -- not a separate
 // voice-only code path (per phase7_prompt.md task 1).
 
-import { ref } from "vue";
+import { computed, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { useChatStore } from "../stores/chat";
+import ModelPicker from "./ModelPicker.vue";
 
-// Phase 7 follow-up: Dementia/Sloth agent toggle. Reads/writes the store directly (like the mic
+// Phase 7 follow-up: Goldfish/Sloth agent toggle. (Shown as "Goldfish" since 2026-11-04; it was
+// labelled "Dementia", which could offend. The stored agent id is still "dementia" so saved
+// conversations keep loading -- this is a display-name change only.) Reads/writes the store directly (like the mic
 // button's own invoke() calls above) rather than round-tripping through App.vue -- this
 // component already isn't purely presentational.
 const store = useChatStore();
@@ -36,9 +39,22 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: "send", text: string): void;
   (e: "voice-send", text: string): void;
+  (e: "setup"): void;
 }>();
 
 const text = ref("");
+
+// A chat reply is being written (not a picture: drawing can't be interrupted).
+const canStop = computed(() => store.generating && Object.keys(store.streamingMessageIds).length > 0);
+
+// One plain-language line under the input saying what will happen with the next message.
+const modeHint = computed(() => {
+  if (canStop.value) return "Writing a reply... press the square to stop it early.";
+  if (store.generating && store.imageMode) return "Drawing your picture. Chat is paused until it finishes (about half a minute).";
+  if (store.imageMode) return "Image mode: describe a picture and Xenon will draw it. Click Image again to go back to chatting.";
+  if (store.activeAgent === "sloth") return "Sloth remembers facts about you across all your chats.";
+  return "Goldfish only remembers this chat. Switch to Sloth to have Xenon remember you across chats.";
+});
 const listening = ref(false);
 const micStatus = ref("");
 
@@ -88,15 +104,17 @@ async function toggleMic() {
 
 <template>
   <div class="input-bar">
+    <ModelPicker @setup="emit('setup')" />
+
     <div class="agent-toggle" title="Which agent handles the next message">
       <button
         class="agent-btn"
         :class="{ active: store.activeAgent === 'dementia' }"
         :disabled="disabled"
-        title="Dementia: no memory outside this chat window"
+        title="Goldfish: remembers only this chat, nothing carries over to other chats"
         @click="store.setActiveAgent('dementia')"
       >
-        Dementia
+        Goldfish
       </button>
       <button
         class="agent-btn"
@@ -183,13 +201,25 @@ async function toggleMic() {
     ></textarea>
 
     <button
+      v-if="canStop"
+      class="send-btn stop-btn"
+      title="Stop writing this reply (keeps what's written so far)"
+      aria-label="Stop"
+      @click="store.stopGeneration()"
+    >
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><rect x="5" y="5" width="14" height="14" rx="2" /></svg>
+    </button>
+    <button
+      v-else
       class="send-btn"
       :disabled="disabled || !text.trim()"
-      title="Send"
+      title="Send (Enter). Shift+Enter for a new line"
       @click="submit"
     >
       ➤
     </button>
+
+    <div class="mode-hint">{{ modeHint }}</div>
   </div>
 </template>
 
@@ -321,6 +351,19 @@ async function toggleMic() {
 .send-btn {
   background: #2f6feb;
   color: #fff;
+}
+.stop-btn {
+  background: #c0392b;
+}
+.stop-btn:hover {
+  background: #d9473a;
+}
+.mode-hint {
+  flex-basis: 100%;
+  font-size: 0.74rem;
+  color: #8a8a8a;
+  padding: 0 0.2rem;
+  margin-top: -0.15rem;
 }
 
 .send-btn:disabled {

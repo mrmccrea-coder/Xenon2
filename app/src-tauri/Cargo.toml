@@ -28,3 +28,4 @@ sysinfo = { version = "0.40", default-features = false, features = ["system", "d
 ureq = "3"
 sha2 = "0.10"
 base64 = "0.22"
+fend-core = "1.5.9"

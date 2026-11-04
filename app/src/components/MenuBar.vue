@@ -17,7 +17,7 @@
 // -- so the click silently never landed. Closing on an outside click/mousedown instead (tracked
 // via a template ref, not focus-based) doesn't have this race for any input method.
 
-import { ref, onMounted, onUnmounted } from "vue";
+import { computed, ref, onMounted, onUnmounted } from "vue";
 
 const props = defineProps<{
   /** Disables Save / Save As when there's no active conversation. */
@@ -26,6 +26,17 @@ const props = defineProps<{
   deviceLabel?: string;
   sidebarOpen?: boolean;
 }>();
+
+// Plain-language version of the device label; the exact technical text stays in the tooltip.
+const friendlyDevice = computed(() => {
+  const l = props.deviceLabel ?? "";
+  // Labels come from inference.rs: "CUDA — all layers on GPU", "CPU (GPU offload failed)", "CPU".
+  // CPU is checked first because the fallback label mentions the GPU too.
+  if (/no model/i.test(l)) return "No model loaded";
+  if (/^cpu/i.test(l)) return /failed/i.test(l) ? "Running on processor (graphics card unavailable)" : "Running on processor";
+  if (/cuda|gpu/i.test(l)) return "Running on graphics card";
+  return l;
+});
 
 const emit = defineEmits<{
   (e: "new"): void;
@@ -139,7 +150,7 @@ function onSlothMemory() {
         <button class="dropdown-item" @click="onSlothMemory">Sloth Memory...</button>
       </div>
     </div>
-    <span v-if="deviceLabel" class="device-label" :title="deviceLabel">{{ deviceLabel }}</span>
+    <span v-if="deviceLabel" class="device-label" :title="deviceLabel">{{ friendlyDevice }}</span>
   </div>
 </template>
 

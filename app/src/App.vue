@@ -17,7 +17,7 @@ import MenuBar from "./components/MenuBar.vue";
 import Sidebar from "./components/Sidebar.vue";
 import ChatMessageVue from "./components/ChatMessage.vue";
 import MessageInput from "./components/MessageInput.vue";
-import ModelPicker from "./components/ModelPicker.vue";
+import ReplyLength from "./components/ReplyLength.vue";
 import ModelSetup from "./components/ModelSetup.vue";
 import { useChatStore } from "./stores/chat";
 
@@ -41,6 +41,28 @@ function applyViewport() {
 // is actually maximized or fullscreened, where the extra horizontal space is deliberate.
 const isWide = ref(false);
 let unlistenWindowResize: UnlistenFn | null = null;
+let unlistenWindowMoved: UnlistenFn | null = null;
+
+// An auto-hiding Windows taskbar slides up over the bottom of a full-screen window, right where
+// the chat box is. The backend reports how much of each window edge it would cover (physical
+// pixels, see taskbar.rs); that edge gets padded so the chat box always stays above it. All zeros
+// for a normal taskbar, which Windows already keeps clear of maximized windows.
+const taskbarPad = ref({ top: 0, right: 0, bottom: 0, left: 0 });
+
+async function refreshTaskbarInset() {
+  try {
+    const i = await invoke<{ top: number; right: number; bottom: number; left: number }>("taskbar_inset");
+    const s = window.devicePixelRatio || 1;
+    taskbarPad.value = {
+      top: Math.ceil(i.top / s),
+      right: Math.ceil(i.right / s),
+      bottom: Math.ceil(i.bottom / s),
+      left: Math.ceil(i.left / s),
+    };
+  } catch (err) {
+    console.warn("[App] taskbar_inset failed:", err);
+  }
+}
 
 async function refreshIsWide() {
   const win = getCurrentWindow();
@@ -149,6 +171,20 @@ async function sendMessage(text: string) {
   scrollToBottom();
 }
 
+// Starter suggestions shown in an empty chat, so a new user sees what the app can do. Clicking
+// one sends it straight away; the picture one switches image mode on first.
+const starters = [
+  { label: "Ask", text: "Tell me a fun fact about the ocean.", image: false },
+  { label: "Write", text: "Write a short story about a fox who finds a lantern in the woods.", image: false },
+  { label: "Plan", text: "Help me plan a relaxing Saturday.", image: false },
+  { label: "Draw", text: "a cozy cabin in a snowy forest at dusk, warm lit windows", image: true },
+];
+
+async function useStarter(s: { text: string; image: boolean }) {
+  store.setImageMode(s.image);
+  await sendMessage(s.text);
+}
+
 // Phase 7: mic button transcript feeds the exact same sendMessage/store path typed text uses --
 // no parallel voice-only code path, per phase7_prompt.md task 1. `viaVoice=true` marks the reply
 // for spoken playback (see store.currentTurnIsVoice and the token-stream/generation-done/
@@ -239,7 +275,11 @@ onMounted(async () => {
   await refreshIsWide();
   unlistenWindowResize = await getCurrentWindow().onResized(() => {
     void refreshIsWide();
+    void refreshTaskbarInset();
   });
+  unlistenWindowMoved = await getCurrentWindow().onMoved(() => void refreshTaskbarInset());
+  window.addEventListener("focus", refreshTaskbarInset);
+  void refreshTaskbarInset();
 
   // Phase 6: export/import progress events (see memory.rs's copy_with_progress).
   unlistenExportProgress = await listen<MemoryProgressPayload>("export-progress", (event) => {
@@ -330,11 +370,21 @@ onUnmounted(() => {
   unlistenVoiceSpeakDone?.();
   unlistenDownloadProgress?.();
   unlistenWindowResize?.();
+  unlistenWindowMoved?.();
+  window.removeEventListener("focus", refreshTaskbarInset);
 });
 </script>
 
 <template>
-  <div class="app-shell">
+  <div
+    class="app-shell"
+    :style="{
+      paddingTop: taskbarPad.top + 'px',
+      paddingRight: taskbarPad.right + 'px',
+      paddingBottom: taskbarPad.bottom + 'px',
+      paddingLeft: taskbarPad.left + 'px',
+    }"
+  >
     <MenuBar
       :has-active-conversation="!!store.activeConversation"
       :device-label="store.deviceLabel"
@@ -357,17 +407,12 @@ onUnmounted(() => {
         :active-id="store.activeId"
         @new-chat="newChat"
         @select="selectConversation"
+        @delete="(id) => store.deleteConversation(id)"
       />
 
       <main class="chat-panel">
         <div class="chat-content" :class="{ wide: isWide }">
-          <ModelPicker
-            :models="store.models"
-            :busy="store.generating || store.switchingModel"
-            :loading="store.switchingModel"
-            @select="(id) => store.switchModel(id)"
-            @setup="openModelSetup"
-          />
+          <ReplyLength :disabled="store.generating || store.switchingModel" />
           <div v-if="!store.activeConversation" class="empty-state">
             <p>No conversation selected.</p>
             <p class="hint">Type a message below, or click "+ New Chat" to get started.</p>
@@ -375,6 +420,21 @@ onUnmounted(() => {
 
           <template v-else>
             <div ref="messagesContainer" class="messages">
+              <div v-if="store.activeConversation.messages.length === 0" class="starter">
+                <p class="starter-title">What would you like to do?</p>
+                <div class="starter-grid">
+                  <button
+                    v-for="s in starters"
+                    :key="s.text"
+                    class="starter-btn"
+                    :disabled="store.generating || (s.image && !store.imageAvailable)"
+                    @click="useStarter(s)"
+                  >
+                    <span class="starter-label">{{ s.label }}</span>
+                    <span class="starter-text">{{ s.text }}</span>
+                  </button>
+                </div>
+              </div>
               <ChatMessageVue
                 v-for="m in store.activeConversation.messages"
                 :key="m.id"
@@ -403,6 +463,7 @@ onUnmounted(() => {
             :speaking="store.speaking"
             @send="sendMessage"
             @voice-send="onVoiceSend"
+            @setup="openModelSetup"
           />
         </div>
       </main>
@@ -501,6 +562,7 @@ onUnmounted(() => {
 
 <style scoped>
 .app-shell {
+  box-sizing: border-box; /* taskbar padding (above) comes out of the height, not on top of it */
   display: flex;
   flex-direction: column;
   height: 100vh;
@@ -578,6 +640,54 @@ onUnmounted(() => {
   color: #888;
   text-align: center;
   gap: 0.3rem;
+}
+
+.starter {
+  margin: auto;
+  padding: 2rem 1rem;
+  max-width: 640px;
+  width: 100%;
+  text-align: center;
+}
+.starter-title {
+  color: #bbb;
+  font-size: 1.05rem;
+  margin-bottom: 1rem;
+}
+.starter-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 0.6rem;
+}
+.starter-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.2rem;
+  text-align: left;
+  padding: 0.7rem 0.85rem;
+  background: #1e1e20;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 10px;
+  color: #ddd;
+  cursor: pointer;
+}
+.starter-btn:hover:not(:disabled) {
+  border-color: rgba(120, 140, 255, 0.6);
+  background: #24242a;
+}
+.starter-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.starter-label {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #8fa0ff;
+}
+.starter-text {
+  font-size: 0.88rem;
 }
 
 .empty-state .hint {
