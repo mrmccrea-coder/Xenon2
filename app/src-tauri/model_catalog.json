@@ -1,5 +1,5 @@
 {
-  "baseUrl": "https://github.com/mrmccrea-coder/Xenon2/releases/download/models-v1",
+  "baseUrl": "https://github.com/mrmccrea-coder/Xenon2-downloads/releases/download/models-v1",
   "models": [
     {
       "tier": "fast",
