@@ -351,7 +351,7 @@ onMounted(async () => {
   await store.refreshVoiceReady();
   const voiceReadyPoll = window.setInterval(async () => {
     await store.refreshVoiceReady();
-    if (store.voiceReady) window.clearInterval(voiceReadyPoll);
+    if (store.voiceReady || !store.voiceAvailable) window.clearInterval(voiceReadyPoll);
   }, 1000);
 });
 

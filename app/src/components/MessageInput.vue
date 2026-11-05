@@ -163,7 +163,7 @@ async function toggleMic() {
       </select>
     </div>
 
-    <div class="mic-wrap">
+    <div v-if="store.voiceAvailable" class="mic-wrap">
       <button
         class="mic-btn"
         :class="{ on: listening }"

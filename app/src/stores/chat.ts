@@ -90,6 +90,9 @@ interface ChatState {
    * ready to accept `voice_listen`/`voice_speak_*` calls. Polled from App.vue via
    * `refreshVoiceReady` since there's no push event for this. */
   voiceReady: boolean;
+  /** False when voice isn't installed at all (no voice-pipeline beside the app, as with the
+   * public installer): the mic button is hidden instead of waiting forever. */
+  voiceAvailable: boolean;
   /** True while the current generation was triggered by a voice transcript (as opposed to typed
    * text) -- App.vue's token-stream/generation-done/generation-error handlers check this to
    * decide whether to also forward text to the voice sidecar's TTS via `voice_speak_feed`/
@@ -246,6 +249,7 @@ export const useChatStore = defineStore("chat", {
     memoryError: null,
     dataDir: null,
     voiceReady: false,
+    voiceAvailable: true,
     currentTurnIsVoice: false,
     speaking: false,
     activeAgent: "dementia",
@@ -627,7 +631,8 @@ export const useChatStore = defineStore("chat", {
      * loading", so polling is the simplest option for what's a one-time, short-lived check. */
     async refreshVoiceReady(): Promise<void> {
       try {
-        this.voiceReady = await invoke<boolean>("voice_ready");
+        this.voiceAvailable = await invoke<boolean>("voice_available");
+        this.voiceReady = this.voiceAvailable && (await invoke<boolean>("voice_ready"));
       } catch (err) {
         console.warn("[chat store] voice_ready check failed:", err);
       }

@@ -24,6 +24,30 @@ pub struct CatalogEntry {
     pub file: String,
     pub size_bytes: u64,
     pub sha256: String,
+    /// When set, the file is hosted as consecutive parts `<file>.001`, `<file>.002`, ... of this
+    /// many bytes each (the last one shorter): GitHub release files are limited to 2 GB and the
+    /// Quality model is 2.75 GB. The parts are downloaded into one file and checked as a whole.
+    #[serde(default)]
+    pub part_bytes: Option<u64>,
+}
+
+impl CatalogEntry {
+    /// (url, length) of each piece to download, in order. A single piece for unsplit files.
+    pub fn pieces(&self, base: &str) -> Vec<(String, u64)> {
+        let base = base.trim_end_matches('/');
+        match self.part_bytes.filter(|p| *p > 0 && *p < self.size_bytes) {
+            None => vec![(format!("{base}/{}", self.file), self.size_bytes)],
+            Some(p) => {
+                let count = self.size_bytes.div_ceil(p);
+                (0..count)
+                    .map(|i| {
+                        let len = if i + 1 == count { self.size_bytes - p * i } else { p };
+                        (format!("{base}/{}.{:03}", self.file, i + 1), len)
+                    })
+                    .collect()
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -112,11 +136,28 @@ pub fn download_file(
     expected_size: u64,
     expected_sha256: &str,
     cancel: &AtomicBool,
+    progress: impl FnMut(u64, u64),
+) -> Result<(), DownloadError> {
+    download_pieces(&[(url.to_string(), expected_size)], dest, expected_size, expected_sha256, cancel, progress)
+}
+
+/// Downloads `pieces` (url, length) one after another into a single `<dest>.part` file, resuming
+/// from however much of it already exists -- including from the middle of any piece -- then checks
+/// the whole file's SHA-256 and moves it to `dest`.
+pub fn download_pieces(
+    pieces: &[(String, u64)],
+    dest: &Path,
+    expected_size: u64,
+    expected_sha256: &str,
+    cancel: &AtomicBool,
     mut progress: impl FnMut(u64, u64),
 ) -> Result<(), DownloadError> {
     let part = PathBuf::from(format!("{}.part", dest.display()));
     if let Some(dir) = dest.parent() {
         fs::create_dir_all(dir).map_err(|e| DownloadError::Failed(format!("Could not create '{}': {e}", dir.display())))?;
+    }
+    if pieces.iter().map(|(_, len)| len).sum::<u64>() != expected_size {
+        return fail("The model catalog's piece sizes don't add up to the file size.");
     }
 
     let mut have = fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
@@ -125,19 +166,37 @@ pub fn download_file(
         have = 0;
     }
 
-    if have < expected_size {
-        let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+    let mut piece_start = 0u64;
+    let mut buf = vec![0u8; 1 << 20];
+    progress(have, expected_size);
+    for (url, len) in pieces {
+        let piece_end = piece_start + len;
+        if have >= piece_end {
+            piece_start = piece_end; // already have all of this piece
+            continue;
+        }
+        // Resume inside this piece if part of it is already on disk.
+        let mut offset = have - piece_start;
         let mut req = agent.get(url);
-        if have > 0 {
-            req = req.header("Range", format!("bytes={have}-"));
+        if offset > 0 {
+            req = req.header("Range", format!("bytes={offset}-"));
         }
         let resp = req.call().map_err(|e| DownloadError::Failed(format!("Could not reach the download server: {e}")))?;
-        let status = resp.status().as_u16();
-        match status {
+        match resp.status().as_u16() {
             206 => {}
-            200 => have = 0, // server ignored the range: start over
+            200 => offset = 0, // server ignored the range: redo this piece from its start
             404 => return fail("The model file was not found on the download server."),
             s => return fail(format!("The download server answered with HTTP {s}.")),
+        }
+        if offset == 0 && have > piece_start {
+            // Throw away the partial piece so the full one can be appended from its start.
+            let f = OpenOptions::new()
+                .write(true)
+                .open(&part)
+                .map_err(|e| DownloadError::Failed(format!("Could not write '{}': {e}", part.display())))?;
+            f.set_len(piece_start).map_err(|e| DownloadError::Failed(format!("Could not write to disk: {e}")))?;
+            have = piece_start;
         }
 
         let mut out = if have == 0 {
@@ -148,9 +207,6 @@ pub fn download_file(
         .map_err(|e| DownloadError::Failed(format!("Could not write '{}': {e}", part.display())))?;
 
         let mut reader = resp.into_body().into_reader();
-        let mut buf = vec![0u8; 1 << 20];
-        let mut done = have;
-        progress(done, expected_size);
         loop {
             if cancel.load(Ordering::Relaxed) {
                 return Err(DownloadError::Cancelled);
@@ -161,11 +217,23 @@ pub fn download_file(
             if n == 0 {
                 break;
             }
+            // Never write past this piece (a misbehaving server can't corrupt the next one).
+            let room = (piece_end - have) as usize;
+            let n = n.min(room);
             out.write_all(&buf[..n]).map_err(|e| DownloadError::Failed(format!("Could not write to disk: {e}")))?;
-            done += n as u64;
-            progress(done, expected_size);
+            have += n as u64;
+            progress(have, expected_size);
+            if have >= piece_end {
+                break;
+            }
         }
         out.flush().ok();
+        if have < piece_end {
+            return fail(format!(
+                "The download ended early ({have} of {expected_size} bytes). Run it again to resume."
+            ));
+        }
+        piece_start = piece_end;
     }
 
     let size = fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
@@ -250,12 +318,12 @@ pub async fn download_model(
         *slot = Some(cancel.clone());
     }
 
-    let url = format!("{}/{}", base.trim_end_matches('/'), entry.file);
+    let pieces = entry.pieces(&base);
     let app2 = app.clone();
     let tier2 = tier_id.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
         let mut last_emit = std::time::Instant::now() - std::time::Duration::from_secs(1);
-        download_file(&url, &dest, entry.size_bytes, &entry.sha256, &cancel, |done, total| {
+        download_pieces(&pieces, &dest, entry.size_bytes, &entry.sha256, &cancel, |done, total| {
             if done >= total || last_emit.elapsed() >= std::time::Duration::from_millis(150) {
                 last_emit = std::time::Instant::now();
                 let _ = app2.emit("model-download-progress", ProgressEvent { tier_id: tier2.clone(), done, total });
@@ -335,6 +403,98 @@ mod tests {
             }
         });
         format!("http://{addr}/model.bin")
+    }
+
+    /// Serves `parts[i]` at any path ending in `.00{i+1}`, honoring `Range: bytes=N-`.
+    fn serve_parts(parts: Vec<Vec<u8>>, connections: usize) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for _ in 0..connections {
+                let Ok((mut stream, _)) = listener.accept() else { return };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let (mut start, mut index) = (0usize, 0usize);
+                let mut first = true;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if first {
+                        // "GET /model.bin.002 HTTP/1.1"
+                        let path = line.split_whitespace().nth(1).unwrap_or("");
+                        index = path.rsplit('.').next().and_then(|n| n.parse::<usize>().ok()).unwrap_or(1) - 1;
+                        first = false;
+                    }
+                    if let Some(v) = line.to_lowercase().strip_prefix("range: bytes=") {
+                        start = v.trim().trim_end_matches('-').parse().unwrap_or(0);
+                    }
+                }
+                let body = &parts[index];
+                let head = if start > 0 {
+                    format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\nConnection: close\r\n\r\n",
+                        body.len() - start, start, body.len() - 1, body.len()
+                    )
+                } else {
+                    format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len())
+                };
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(&body[start..]);
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn split_entry(size: u64, sha: &str, part_bytes: u64) -> CatalogEntry {
+        CatalogEntry { tier: "t".into(), file: "model.bin".into(), size_bytes: size, sha256: sha.into(), part_bytes: Some(part_bytes) }
+    }
+
+    #[test]
+    fn quality_model_is_split_into_two_parts_under_githubs_limit() {
+        let q = entry_for_tier("quality").unwrap();
+        let pieces = q.pieces("https://example.com/rel/");
+        assert_eq!(pieces.len(), 2);
+        assert_eq!(pieces[0].0, "https://example.com/rel/rwkv7-g1-2.9B-Q5_1.bin.001");
+        assert_eq!(pieces[1].0, "https://example.com/rel/rwkv7-g1-2.9B-Q5_1.bin.002");
+        assert_eq!(pieces.iter().map(|p| p.1).sum::<u64>(), q.size_bytes);
+        assert!(pieces.iter().all(|p| p.1 < 2 * 1024 * 1024 * 1024), "each part under GitHub's 2 GiB limit");
+        // unsplit models stay a single download
+        assert_eq!(entry_for_tier("fast").unwrap().pieces("https://x").len(), 1);
+    }
+
+    #[test]
+    fn downloads_a_split_file_and_verifies_the_whole() {
+        let (body, sha) = sample();
+        let entry = split_entry(body.len() as u64, &sha, 1_200_000);
+        let parts: Vec<Vec<u8>> = body.chunks(1_200_000).map(|c| c.to_vec()).collect();
+        assert_eq!(parts.len(), 3);
+        let base = serve_parts(parts, 3);
+        let dir = tmp("split");
+        let dest = dir.join("m.bin");
+        download_pieces(&entry.pieces(&base), &dest, body.len() as u64, &sha, &AtomicBool::new(false), |_, _| {}).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), body);
+    }
+
+    #[test]
+    fn resumes_a_split_file_from_inside_either_part() {
+        let (body, sha) = sample();
+        for already in [500_000usize, 1_700_000] {
+            // 500k: inside part 1; 1.7M: inside part 2 (part 1 complete)
+            let entry = split_entry(body.len() as u64, &sha, 1_200_000);
+            let parts: Vec<Vec<u8>> = body.chunks(1_200_000).map(|c| c.to_vec()).collect();
+            let remaining_requests = parts.len() - already / 1_200_000;
+            let base = serve_parts(parts, remaining_requests);
+            let dir = tmp(&format!("split_resume_{already}"));
+            fs::write(dir.join("m.bin.part"), &body[..already]).unwrap();
+            let mut first_progress = None;
+            download_pieces(&entry.pieces(&base), &dir.join("m.bin"), body.len() as u64, &sha, &AtomicBool::new(false), |d, _| {
+                first_progress.get_or_insert(d);
+            })
+            .unwrap();
+            assert_eq!(first_progress, Some(already as u64), "picked up where it left off");
+            assert_eq!(fs::read(dir.join("m.bin")).unwrap(), body);
+        }
     }
 
     fn sample() -> (Vec<u8>, String) {

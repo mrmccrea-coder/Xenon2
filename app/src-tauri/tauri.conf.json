@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Xenon2",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "identifier": "com.xenon2.app",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -39,7 +39,8 @@
       "../../inference-engine/build-cuda-app/bin/Release/msvcp140.dll": "msvcp140.dll",
       "../../inference-engine/build-cuda-app/bin/Release/msvcp140_1.dll": "msvcp140_1.dll",
       "../../inference-engine/build-cuda-app/bin/Release/msvcp140_2.dll": "msvcp140_2.dll",
-      "../../inference-engine/build-cuda-app/bin/Release/concrt140.dll": "concrt140.dll"
+      "../../inference-engine/build-cuda-app/bin/Release/concrt140.dll": "concrt140.dll",
+      "../../inference-engine/build-cuda-app/bin/Release/vcomp140.dll": "vcomp140.dll"
     },
     "icon": [
       "icons/32x32.png",

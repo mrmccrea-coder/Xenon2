@@ -1,5 +1,5 @@
 {
-  "baseUrl": "",
+  "baseUrl": "https://github.com/mrmccrea-coder/Xenon2/releases/download/models-v1",
   "models": [
     {
       "tier": "fast",
@@ -17,7 +17,8 @@
       "tier": "quality",
       "file": "rwkv7-g1-2.9B-Q5_1.bin",
       "sizeBytes": 2752905804,
-      "sha256": "1e755fec37217bb7187f9807d7db8fa2a1c2a91927d990b81cb5ffe2d4e04e13"
+      "sha256": "1e755fec37217bb7187f9807d7db8fa2a1c2a91927d990b81cb5ffe2d4e04e13",
+      "partBytes": 1500000000
     }
   ]
 }

@@ -205,6 +205,14 @@ pub fn voice_ready(voice: tauri::State<'_, VoiceState>) -> bool {
     voice.0.spawn_error.is_none() && voice.0.ready.load(Ordering::SeqCst)
 }
 
+/// False when voice isn't installed at all (the voice-pipeline sidecar could not be started, e.g.
+/// on a PC that got the app from the public installer, which doesn't include the Python voice
+/// pipeline). The UI hides the mic then, instead of showing it as "still starting up" forever.
+#[tauri::command]
+pub fn voice_available(voice: tauri::State<'_, VoiceState>) -> bool {
+    voice.0.spawn_error.is_none()
+}
+
 /// Records from the mic, VAD-gated, and transcribes the resulting utterance. Blocks (on a
 /// background thread, not the async runtime) for up to `max_listen_sec` waiting for speech to
 /// start, then up to `max_utterance_sec` more while it's captured, plus STT time -- the timeout
