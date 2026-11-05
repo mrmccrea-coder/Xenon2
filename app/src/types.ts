@@ -36,6 +36,10 @@ export interface ChatMessage {
   image?: string;
   /** The prompt that produced `image`, kept so Regenerate can redraw it. */
   imagePrompt?: string;
+  /** Brush-to-edit result: the picture it was edited from, and the saved brush mask. With these,
+   * Regenerate redoes the edit (new seed) instead of drawing a new picture from scratch. */
+  editSource?: string;
+  editMask?: string;
 }
 
 export interface Conversation {

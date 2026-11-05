@@ -177,6 +177,7 @@ pub fn run() {
             image::generate_image,
             image::read_image,
             image::save_image_as,
+            image::edit_image,
             models_dl::download_model,
             models_dl::cancel_model_download,
             persistence::save_conversation_file,

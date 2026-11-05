@@ -53,6 +53,12 @@ pub struct ConversationFileMessage {
     pub image: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "imagePrompt")]
     pub image_prompt: Option<String>,
+    /// For a brush-to-edit result: the picture it was edited from and the saved brush mask, so
+    /// Regenerate redoes the same edit with a new seed.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "editSource")]
+    pub edit_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "editMask")]
+    pub edit_mask: Option<String>,
 }
 
 /// The full on-disk shape of one saved conversation. Mirrors `SCHEMA.md` field-for-field.

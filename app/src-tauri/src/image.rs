@@ -57,6 +57,38 @@ fn vae_file(root: &Path) -> Option<PathBuf> {
     found.into_iter().next()
 }
 
+/// The inpainting model used by brush-to-edit, if installed: a file in `models/image` with
+/// "inpaint" in its name (e.g. `sdxl_inpainting_0.1.safetensors`). It is a separate model from the
+/// picture models because only a model trained for inpainting can draw a *new* object into a
+/// painted area: tested 2026-11-04, the regular SDXL-Lightning model asked to add a camper trailer
+/// into a masked area kept everything else identical but filled the area with more trees.
+fn inpaint_file(root: &Path) -> Option<PathBuf> {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(models_dir(root))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_lowercase();
+            name.contains("inpaint") && (name.ends_with(".safetensors") || name.ends_with(".gguf"))
+        })
+        .collect();
+    found.sort();
+    found.into_iter().next()
+}
+
+/// Width and height from a PNG's IHDR header, so an edit keeps the picture's exact size.
+fn png_size(path: &Path) -> Option<(u32, u32)> {
+    let mut head = [0u8; 24];
+    File::open(path).ok()?.read_exact(&mut head).ok()?;
+    if &head[1..4] != b"PNG" || &head[12..16] != b"IHDR" {
+        return None;
+    }
+    let w = u32::from_be_bytes(head[16..20].try_into().ok()?);
+    let h = u32::from_be_bytes(head[20..24].try_into().ok()?);
+    Some((w, h))
+}
+
 fn images_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app
         .path()
@@ -81,6 +113,9 @@ pub struct ImageStatus {
     pub reason: Option<String>,
     pub models: Vec<ImageModel>,
     pub sizes: Vec<u32>,
+    /// Brush-to-edit is possible (the inpainting model is installed).
+    #[serde(rename = "canEdit")]
+    pub can_edit: bool,
 }
 
 /// "sdxl_lightning_4step.q4_0.gguf" -> "sdxl lightning 4step q4 0"
@@ -117,7 +152,8 @@ pub fn image_status(root: tauri::State<'_, RepoRoot>) -> ImageStatus {
     } else {
         None
     };
-    ImageStatus { available: reason.is_none(), reason, models, sizes: ALLOWED_SIZES.to_vec() }
+    let can_edit = reason.is_none() && inpaint_file(&root.0).is_some();
+    ImageStatus { available: reason.is_none(), reason, models, sizes: ALLOWED_SIZES.to_vec(), can_edit }
 }
 
 /// Sampler settings implied by the file name. Distilled "Lightning"/"Turbo" models want a handful
@@ -292,6 +328,118 @@ fn own_image(app: &AppHandle, path: &str) -> Result<PathBuf, String> {
     Ok(file)
 }
 
+/// Sampler settings for brush-to-edit with the SDXL inpainting model (a full SDXL model, not a
+/// distilled Lightning one, so it needs more steps). Guidance must stay low: the engine's
+/// maintainers note inpainting models misbehave at high CFG (stable-diffusion.cpp issue #1309).
+const EDIT_STEPS: u32 = 24;
+const EDIT_CFG: &str = "4.0";
+
+#[derive(Serialize)]
+pub struct EditResult {
+    pub path: String,
+    /// Where the brush mask was saved, so Regenerate can redo the same edit with a new seed.
+    #[serde(rename = "maskPath")]
+    pub mask_path: String,
+    pub seed: u64,
+    pub secs: f32,
+    pub warning: Option<String>,
+}
+
+/// Brush-to-edit: repaints only the white area of `mask` in `source` (one of our own pictures),
+/// following `prompt`; everything outside the mask is kept. `mask` is either a PNG data URL from
+/// the brush editor, or the path of a mask saved by an earlier edit (Regenerate on an edit).
+/// Same chat-model unload/reload as `generate_image`.
+#[tauri::command]
+pub async fn edit_image(
+    app: AppHandle,
+    engine: tauri::State<'_, EngineState>,
+    root: tauri::State<'_, RepoRoot>,
+    source: String,
+    mask: String,
+    prompt: String,
+) -> Result<EditResult, String> {
+    let prompt: String = prompt.trim().trim_start_matches('-').trim().chars().take(MAX_PROMPT_CHARS).collect();
+    if prompt.is_empty() || prompt.contains('\0') {
+        return Err("Describe what should appear in the painted area.".to_string());
+    }
+    let source = own_image(&app, &source)?;
+    let (w, h) = png_size(&source).ok_or_else(|| "Could not read the picture's size.".to_string())?;
+    let root_path = root.0.clone();
+    let exe = engine_exe(&root_path);
+    let model = inpaint_file(&root_path).ok_or_else(|| "The editing model isn't installed.".to_string())?;
+    let vae = vae_file(&root_path);
+    let out_dir = images_dir(&app)?;
+    let seed = random_seed();
+    let stamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+
+    // The mask: decode a fresh one from the editor, or reuse a saved one (must be ours).
+    let mask_path = if let Some(b64) = mask.strip_prefix("data:image/png;base64,") {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64.trim())
+            .map_err(|_| "The painted area could not be read.".to_string())?;
+        let p = out_dir.join(format!("mask_{stamp}_{seed}.png"));
+        std::fs::write(&p, bytes).map_err(|e| format!("Could not save the painted area: {e}"))?;
+        p
+    } else {
+        let dir = out_dir.canonicalize().map_err(|e| e.to_string())?;
+        let p = PathBuf::from(&mask).canonicalize().map_err(|_| "The painted area no longer exists.".to_string())?;
+        if !p.starts_with(&dir) {
+            return Err("Not a mask made by Xenon2.".to_string());
+        }
+        p
+    };
+
+    let out_path = out_dir.join(format!("img_{stamp}_{seed}_edit.png"));
+    let log_path = out_dir.join("last_run.log");
+    let engine_state = engine.inner().clone();
+    let app2 = app.clone();
+    let (out2, mask2) = (out_path.clone(), mask_path.clone());
+    let (run, reload_err, secs) = tauri::async_runtime::spawn_blocking(move || {
+        let t0 = Instant::now();
+        let _ = app2.emit("image-stage", "Freeing the chat model...");
+        let app3 = app2.clone();
+        let (run, reload_err) = with_engine_unloaded(&engine_state, &root_path, move || {
+            let _ = app3.emit("image-stage", "Editing the picture... (about a minute; chat reloads afterward)");
+            let mut cmd = Command::new(&exe);
+            cmd.current_dir(exe.parent().unwrap_or(Path::new(".")))
+                .arg("-m").arg(&model)
+                .arg("-i").arg(&source)
+                .arg("--mask").arg(&mask2)
+                .arg("--strength").arg("1.0")
+                .arg("-p").arg(&prompt)
+                .arg("-n").arg("blurry, distorted, deformed, low quality")
+                .arg("--cfg-scale").arg(EDIT_CFG)
+                .arg("--steps").arg(EDIT_STEPS.to_string())
+                .arg("--sampling-method").arg("euler_a")
+                .arg("-W").arg(w.to_string())
+                .arg("-H").arg(h.to_string())
+                .arg("-s").arg(seed.to_string())
+                .arg("--vae-tiling")
+                .arg("--offload-to-cpu")
+                .arg("--max-vram").arg("1.0")
+                .arg("-o").arg(&out2);
+            if let Some(v) = &vae {
+                cmd.arg("--vae").arg(v);
+            }
+            run_with_timeout(cmd, &log_path)
+        });
+        (run, reload_err, t0.elapsed().as_secs_f32())
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    run?;
+    if !out_path.exists() {
+        return Err("The image engine finished but produced no picture.".to_string());
+    }
+    Ok(EditResult {
+        path: out_path.to_string_lossy().into_owned(),
+        mask_path: mask_path.to_string_lossy().into_owned(),
+        seed,
+        secs,
+        warning: reload_err,
+    })
+}
+
 /// "Download" button on a picture: asks where to save it, then copies the PNG there. Returns the
 /// saved path, or None if the user cancelled. The dialog may take a while (the user is browsing
 /// for a folder), so it is given far longer than the conversation dialogs' hang guard.
@@ -360,6 +508,38 @@ mod tests {
     #[test]
     fn labels_are_readable() {
         assert_eq!(label_for("sdxl_lightning_4step.q4_0.gguf"), "sdxl lightning 4step q4 0");
+    }
+
+    #[test]
+    fn inpaint_model_is_found_and_not_mistaken_for_a_picture_model_or_vae() {
+        let dir = std::env::temp_dir().join(format!("xenon_inpaint_test_{}", std::process::id()));
+        let m = dir.join("models").join("image");
+        std::fs::create_dir_all(&m).unwrap();
+        assert!(inpaint_file(&dir).is_none());
+        std::fs::write(m.join("model.gguf"), b"x").unwrap();
+        std::fs::write(m.join("sdxl_vae_fp16_fix.safetensors"), b"x").unwrap();
+        std::fs::write(m.join("sdxl_inpainting_0.1.safetensors"), b"x").unwrap();
+        assert!(inpaint_file(&dir).unwrap().ends_with("sdxl_inpainting_0.1.safetensors"));
+        assert!(vae_file(&dir).unwrap().ends_with("sdxl_vae_fp16_fix.safetensors"));
+        assert_eq!(list_models(&dir).len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn png_size_reads_the_header() {
+        let dir = std::env::temp_dir().join(format!("xenon_png_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // minimal PNG signature + IHDR for 1024 x 768
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13, b'I', b'H', b'D', b'R'];
+        png.extend_from_slice(&1024u32.to_be_bytes());
+        png.extend_from_slice(&768u32.to_be_bytes());
+        png.extend_from_slice(&[8, 6, 0, 0, 0]);
+        let p = dir.join("t.png");
+        std::fs::write(&p, &png).unwrap();
+        assert_eq!(png_size(&p), Some((1024, 768)));
+        std::fs::write(&p, b"not a png at all, definitely").unwrap();
+        assert_eq!(png_size(&p), None);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -23,6 +23,8 @@ export interface ConversationFileMessage {
   agent?: "dementia" | "sloth";
   image?: string;
   imagePrompt?: string;
+  editSource?: string;
+  editMask?: string;
 }
 
 export interface ConversationFile {
@@ -64,6 +66,8 @@ export function toConversationFile(convo: Conversation, fallbackModel: string): 
       if (m.agent) out.agent = m.agent;
       if (m.image) out.image = m.image;
       if (m.imagePrompt) out.imagePrompt = m.imagePrompt;
+      if (m.editSource) out.editSource = m.editSource;
+      if (m.editMask) out.editMask = m.editMask;
       return out;
     }),
   };
@@ -88,6 +92,8 @@ export function fromConversationFile(file: ConversationFile): Conversation {
         agent: m.agent,
         image: m.image,
         imagePrompt: m.imagePrompt,
+        editSource: m.editSource,
+        editMask: m.editMask,
       })
     ),
   };
