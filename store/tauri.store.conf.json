@@ -1,0 +1,5 @@
+{
+  "productName": "Xenon2 Test",
+  "identifier": "com.xenon2.test",
+  "app": { "windows": [ { "title": "Xenon2 Test", "width": 1200, "height": 800, "minWidth": 480, "minHeight": 420, "center": true, "maximized": true } ] }
+}

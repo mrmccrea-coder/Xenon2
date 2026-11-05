@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Xenon2 Test - Microsoft Store package manifest. build-msix.ps1 fills the {{...}} values.
+     IdentityName / Publisher / PublisherDisplayName MUST be copied from Partner Center
+     (Product management > Product identity) once the app name is reserved. -->
+<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+         xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+         xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+         IgnorableNamespaces="uap rescap">
+  <Identity Name="{{IdentityName}}" Publisher="{{Publisher}}" Version="{{Version}}" ProcessorArchitecture="x64" />
+  <Properties>
+    <DisplayName>Xenon2 Test</DisplayName>
+    <PublisherDisplayName>{{PublisherDisplayName}}</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+  <Resources><Resource Language="en-us" /></Resources>
+  <Applications>
+    <Application Id="Xenon2Test" Executable="xenon2.exe" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements DisplayName="Xenon2 Test" Description="Private AI chat that runs on your own PC."
+          BackgroundColor="transparent" Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png" />
+    </Application>
+  </Applications>
+  <Capabilities>
+    <!-- Tauri desktop apps run as full-trust Win32. Declared + justified in COMPLIANCE.md C-5. -->
+    <rescap:Capability Name="runFullTrust" />
+    <!-- One-time model download only. -->
+    <Capability Name="internetClient" />
+    <!-- No microphone: voice is not shipped in this build. Add <DeviceCapability Name="microphone"/> only with COMPLIANCE.md C-6. -->
+  </Capabilities>
+</Package>

@@ -28,13 +28,27 @@ const MAX_PROMPT_CHARS: usize = 1000;
 const TIMEOUT: Duration = Duration::from_secs(900);
 const ALLOWED_SIZES: [u32; 3] = [512, 768, 1024];
 
+/// Store builds ship the image engine and models inside the read-only package (beside the exe);
+/// use that copy when the data root has none. See store/COMPLIANCE.md.
+fn image_root(root: &Path) -> PathBuf {
+    #[cfg(feature = "store")]
+    if !root.join("image-engine").exists() {
+        if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+            if dir.join("image-engine").exists() {
+                return dir;
+            }
+        }
+    }
+    root.to_path_buf()
+}
+
 fn engine_exe(root: &Path) -> PathBuf {
     let name = if cfg!(windows) { "sd-cli.exe" } else { "sd-cli" };
-    root.join("image-engine").join("bin").join(name)
+    image_root(root).join("image-engine").join("bin").join(name)
 }
 
 fn models_dir(root: &Path) -> PathBuf {
-    root.join("models").join("image")
+    image_root(root).join("models").join("image")
 }
 
 /// A standalone SDXL decoder (VAE) in `models/image`, if one is installed: any `.safetensors` file

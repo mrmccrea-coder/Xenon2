@@ -29,3 +29,7 @@ ureq = "3"
 sha2 = "0.10"
 base64 = "0.22"
 fend-core = "1.5.9"
+
+[features]
+# Microsoft Store (MSIX) build: never write beside the executable. See COMPLIANCE.md.
+store = []

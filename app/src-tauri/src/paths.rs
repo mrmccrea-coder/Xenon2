@@ -43,6 +43,15 @@ pub fn resolve_repo_root(app: &AppHandle) -> PathBuf {
         .unwrap_or_default();
     let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()));
     let data_dir = app.path().app_data_dir().unwrap_or_else(|_| PathBuf::from("."));
+    // Microsoft Store (MSIX) builds install into the read-only WindowsApps folder, and the
+    // bundled vocab beside the exe would make choose_root pick that folder. Store builds always
+    // keep models and user data in the per-user app data folder. See COMPLIANCE.md (C-3).
+    #[cfg(feature = "store")]
+    let root = {
+        let _ = (dev_checkout, exe_dir);
+        data_dir
+    };
+    #[cfg(not(feature = "store"))]
     let root = choose_root(
         std::env::var_os("XENON_HOME").map(PathBuf::from),
         dev_checkout,

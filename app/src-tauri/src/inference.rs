@@ -210,7 +210,15 @@ fn tier_by_id(id: &str) -> Option<&'static ModelTier> {
 
 fn tier_model_path(repo_root: &PathBuf, tier: &ModelTier) -> Option<PathBuf> {
     let dir = repo_root.join("models");
-    tier.candidates.iter().map(|f| dir.join(f)).find(|p| p.exists())
+    let found = tier.candidates.iter().map(|f| dir.join(f)).find(|p| p.exists());
+    // Store builds ship a model inside the (read-only) package at <install>/models, so setup is
+    // automatic. A model the user downloaded into app data still wins. See store/COMPLIANCE.md.
+    #[cfg(feature = "store")]
+    let found = found.or_else(|| {
+        let bundled = std::env::current_exe().ok()?.parent()?.join("models");
+        tier.candidates.iter().map(|f| bundled.join(f)).find(|p| p.exists())
+    });
+    found
 }
 
 fn vocab_path_for(repo_root: &PathBuf) -> PathBuf {
