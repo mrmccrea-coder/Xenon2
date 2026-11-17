@@ -369,6 +369,57 @@ on this model/hardware -- real, measurable waste removed, not a change
 that was ever going to unblock the app's overall speed by itself.
 
 ---
+
+## Current state (as of 2026-11-16)
+
+Supersedes older statements elsewhere in this file where they conflict (older sections are kept as
+history).
+
+**Models.** Only one tier remains: **Quality** = RWKV7-G1 2.9B, Q5_1 (`rwkv7-g1-2.9B-Q5_1.bin`).
+The Fast (0.4B) and Balanced (1.5B) tiers were removed (commit `3814a28`); 0.4B gave wrong
+arithmetic and nonsense on short prompts, and a weak PC now has no smaller fallback. The tier table
+is `MODEL_TIERS` in `app/src-tauri/src/inference.rs`; `app/src-tauri/model_catalog.json` holds the
+file's size and SHA-256 (split into two parts for GitHub's 2 GB limit). The in-app model picker,
+hardware detection (`hardware.rs`: RAM/GPU/bandwidth, predicted tok/s) and the resumable,
+checksum-verified downloader (`models_dl.rs`) all exist. Hot-swapping models without losing the
+running one on failure is implemented.
+
+**Features added since Phase 10.** Copy-loop guard in the engine (`xenon_set_copy_guard`),
+built-in calculator (`calc.rs`, fend-core), SDXL image-generation mode (`image.rs`, stable-diffusion.cpp),
+Stop button, reply-length control, UI overhaul (model button in the input bar, "Goldfish" is the
+display name for the old "Dementia" mode), auto-hide-taskbar inset, picture download button.
+Brush-to-edit images: backend `edit_image` done, not in the UI; SDXL inpainting was inconclusive.
+Image generation is NOT in the normal installer (engine and SDXL models are not bundled or
+downloaded yet).
+
+**Distribution.**
+- Source repo `mrmccrea-coder/Xenon2` is **public**, `master` is the default branch, licensed
+  **PolyForm Noncommercial 1.0.0** (`LICENSE`): free for noncommercial use, commercial use needs
+  the author's permission. This is source-available, not OSI open source.
+- `mrmccrea-coder/Xenon2-downloads` (README + releases only) hosts the installer and models.
+- Both repos have a published `v0.2.0` release (the CUDA installer `Xenon2_0.2.0_x64-setup.exe`,
+  falls back to CPU, bundles `vcomp140.dll`) and `models-v1` (the G1 models).
+- Microsoft Store path **paused** (no cut-down version wanted); work kept on branch `xenon2-test`.
+- Collaborator `Jake-Brewer` has push access; leave his code (notably `build.rs`) intact and report
+  rather than edit.
+
+**Backend measurements (2026-11-03/05, this laptop).** llama.cpp Vulkan on the A1000 ran the 1.5B at
+about 80-96 tok/s vs 24 for our CUDA engine; 2.9B on Vulkan hit an undiagnosed cliff (~2-8 tok/s).
+A 7.2B Q4_K_M split across GPU and CPU reached about 6-8 tok/s. Output quality of the GGUF quants
+was not checked. Bigger models alone do not fix the reply-copying loop.
+
+**Open items.**
+1. Voice is not installed on the Iris Xe machine (needs the venv + Piper voice);
+   `voice-pipeline/README.md` still names the old 0.4B model.
+2. Re-benchmark GPU vs CPU inference under full-pipeline load once voice is in the UI.
+3. Dialog-hang investigation on this machine is paused (needs a UAC-elevated Procmon trace, or a
+   check that Save As works for a human in the real app).
+4. The `Xenon2-downloads` first commit still contains the user's email in its README.
+5. Decide whether to move the backend to llama.cpp (faster on Vulkan, not yet tested for state
+   continuation on GPU or with 2.9B).
+6. Phases 1-10 notes above still mention the 0.4B/World models; those are history.
+
+---
 ## This computer vs the 2060 laptop (2026-10-31)
 
 Two machines. The RTX 2060 is not attached here. This box is an Intel i5-1235U with Iris Xe
@@ -416,7 +467,8 @@ Open, in priority order:
 
 ## Future work (not yet scheduled)
 
-- Mamba backend as an alternative to RWKV, once `mamba.cpp` tooling matures.
+- Mamba backend as an alternative to RWKV, once `mamba.cpp` tooling matures (low priority; the
+  RWKV-7 G1 models already work and are benchmarked).
 - GPU acceleration is wired: `inference-engine/build_cuda.sh` targets sm_75 (RTX 2060) and the
   app offloads every layer when that build is present, with a CPU retry if CUDA init fails.
   This Iris Xe machine uses `./build_cpu.sh` instead.
