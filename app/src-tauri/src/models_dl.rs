@@ -459,8 +459,6 @@ mod tests {
         assert_eq!(pieces[1].0, "https://example.com/rel/rwkv7-g1-2.9B-Q5_1.bin.002");
         assert_eq!(pieces.iter().map(|p| p.1).sum::<u64>(), q.size_bytes);
         assert!(pieces.iter().all(|p| p.1 < 2 * 1024 * 1024 * 1024), "each part under GitHub's 2 GiB limit");
-        // unsplit models stay a single download
-        assert_eq!(entry_for_tier("fast").unwrap().pieces("https://x").len(), 1);
     }
 
     #[test]
@@ -597,7 +595,7 @@ mod tests {
     #[test]
     fn catalog_is_well_formed() {
         let c = catalog();
-        for tier in ["fast", "balanced", "quality"] {
+        for tier in ["quality"] {
             let e = c.models.iter().find(|m| m.tier == tier).unwrap_or_else(|| panic!("missing {tier}"));
             assert_eq!(e.sha256.len(), 64);
             assert!(e.size_bytes > 100_000_000);

@@ -183,19 +183,7 @@ struct ModelTier {
     candidates: &'static [&'static str],
 }
 
-const MODEL_TIERS: [ModelTier; 3] = [
-    ModelTier {
-        id: "fast",
-        label: "Fast",
-        blurb: "~0.4B, quick but error-prone",
-        candidates: &["rwkv7-g1-0.4B-Q5_1.bin", "rwkv-5-world-0.4B-Q4_0.bin"],
-    },
-    ModelTier {
-        id: "balanced",
-        label: "Balanced",
-        blurb: "~1.5B, good all-rounder",
-        candidates: &["rwkv7-g1-1.5B-Q5_1.bin"],
-    },
+const MODEL_TIERS: [ModelTier; 1] = [
     ModelTier {
         id: "quality",
         label: "Quality",
@@ -455,7 +443,7 @@ fn recommendation(app: &AppHandle, repo_root: &PathBuf, hw: &hardware::HardwareR
 fn no_model_message(repo_root: &PathBuf) -> String {
     format!(
         "No model is installed yet. Use \"Set up models\" to download one, or copy a model file \
-         (for example rwkv7-g1-1.5B-Q5_1.bin) into {}.",
+         (for example rwkv7-g1-2.9B-Q5_1.bin) into {}.",
         repo_root.join("models").display()
     )
 }
@@ -1808,10 +1796,9 @@ mod model_tests {
 
     #[test]
     fn tier_falls_back_to_the_legacy_file() {
-        let root = temp_root("fallback", &["rwkv-7-world-2.9B-Q5_1.bin", "rwkv-5-world-0.4B-Q4_0.bin"]);
+        let root = temp_root("fallback", &["rwkv-7-world-2.9B-Q5_1.bin"]);
         assert!(tier_model_path(&root, tier_by_id("quality").unwrap()).unwrap().ends_with("rwkv-7-world-2.9B-Q5_1.bin"));
-        assert!(tier_model_path(&root, tier_by_id("fast").unwrap()).unwrap().ends_with("rwkv-5-world-0.4B-Q4_0.bin"));
-        assert!(tier_model_path(&root, tier_by_id("balanced").unwrap()).is_none(), "no balanced file and no legacy substitute");
+        assert!(tier_by_id("fast").is_none() && tier_by_id("balanced").is_none(), "removed tiers");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1851,8 +1838,11 @@ mod model_tests {
     fn hot_swap_and_failed_switch_keep_a_working_engine() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap().to_path_buf();
         let vocab = vocab_path_for(&root);
-        let small = tier_model_path(&root, tier_by_id("fast").unwrap()).expect("fast model installed");
-        let mid = tier_model_path(&root, tier_by_id("balanced").unwrap()).expect("balanced model installed");
+        // Two different files are needed to exercise a swap; the removed 0.4B/1.5B tiers are no
+        // longer in MODEL_TIERS, so point at their files directly (skip if not on this machine).
+        let small = root.join("models").join("rwkv7-g1-0.4B-Q5_1.bin");
+        let mid = tier_model_path(&root, tier_by_id("quality").unwrap()).expect("quality model installed");
+        assert!(small.exists(), "needs a second model file to swap from");
 
         let (first, name1, _) = build_engine_inner(&small, &vocab).unwrap();
         let holder = Mutex::new(first);

@@ -792,9 +792,9 @@ to the next turn's queueing delay; after it, both are zero.
 
 ## Model picker, hardware detection and model downloads
 
-The top of the chat has three buttons, **Fast / Balanced / Quality**, plus a **Set up** button.
-Each tier maps to a model file in `models/` (first existing candidate wins, so older files still
-work): Fast = RWKV7-G1 0.4B, Balanced = G1 1.5B, Quality = G1 2.9B, all Q5_1. `inference.rs`
+The Fast (0.4B) and Balanced (1.5B) tiers were removed; **Quality** (RWKV7-G1 2.9B, Q5_1) is the
+only tier. Each tier maps to a model file in `models/` (first existing candidate wins, so older
+files still work). `inference.rs`
 holds the tier table (`MODEL_TIERS`); `model_catalog.json` holds each file's exact size and SHA-256.
 
 **Switching** (`switch_model`) loads the new model first and swaps it in under the engine lock, so a
